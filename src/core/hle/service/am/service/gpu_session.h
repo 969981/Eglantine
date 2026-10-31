@@ -20,7 +20,7 @@ struct GpuDeviceRegistry;
 
 class IGpuSession final : public ServiceFramework<IGpuSession> {
 public:
-    IGpuSession(Core::System& system, std::shared_ptr<Nvidia::Module> module,
+    IGpuSession(Core::System& core_system, std::shared_ptr<Nvidia::Module> module,
                 Kernel::KProcess* process, bool legacy_protocol = false);
     ~IGpuSession() override;
     Result RegisterAddressSpace(u32 id);
