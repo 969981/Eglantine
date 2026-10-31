@@ -47,9 +47,9 @@ struct GpuDeviceRegistry {
 namespace {
 class IGpuWorker final : public ServiceFramework<IGpuWorker> {
 public:
-    IGpuWorker(Core::System& system, std::shared_ptr<Nvidia::Module> module,
+    IGpuWorker(Core::System& core_system, std::shared_ptr<Nvidia::Module> module,
                Kernel::KProcess* process, std::shared_ptr<GpuDeviceRegistry> devices)
-        : ServiceFramework{system, "IGpuWorker"}, m_devices{std::move(devices)},
+        : ServiceFramework{core_system, "IGpuWorker"}, m_devices{std::move(devices)},
           m_module{std::move(module)}, m_process{process} {
         m_process->Open(kernel);
         static const FunctionInfo functions[] = {
@@ -377,12 +377,12 @@ private:
 };
 } // namespace
 
-IGpuSession::IGpuSession(Core::System& system, std::shared_ptr<Nvidia::Module> module,
+IGpuSession::IGpuSession(Core::System& core_system, std::shared_ptr<Nvidia::Module> module,
                          Kernel::KProcess* process, bool legacy_protocol)
-    : ServiceFramework{system, "IGpuSession"},
+    : ServiceFramework{core_system, "IGpuSession"},
       m_process{process}, m_module{std::move(module)}, m_legacy_protocol{legacy_protocol} {
     m_process->Open(kernel);
-    m_devices = std::make_shared<GpuDeviceRegistry>(system, m_module, m_process);
+    m_devices = std::make_shared<GpuDeviceRegistry>(core_system, m_module, m_process);
     static const FunctionInfo functions[] = {
         {11, &IGpuSession::GetNotificationRange, "GetNotificationRange"},
         {12, &IGpuSession::GetNotificationEvent, "GetNotificationEvent"},
