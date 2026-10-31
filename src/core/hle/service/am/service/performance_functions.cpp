@@ -5,8 +5,8 @@
 
 namespace Service::AM {
 
-IPerformanceFunctions::IPerformanceFunctions(Core::System& system)
-    : ServiceFramework{system, "IPerformanceFunctions"} {
+IPerformanceFunctions::IPerformanceFunctions(Core::System& core_system)
+    : ServiceFramework{core_system, "IPerformanceFunctions"} {
     static const FunctionInfo functions[] = {
         {0, nullptr, "IsCpuOverclockEnabled"},
         {1, nullptr, "SetCpuOverclockEnabled"},
