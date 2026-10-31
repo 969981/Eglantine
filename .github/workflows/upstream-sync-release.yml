@@ -10,7 +10,7 @@ on:
       force_build:
         description: Build even if the upstream master commit has not changed
         type: boolean
-        default: false
+        default: true
   push:
     branches:
       - "2ndAdjustmentVulkanV3-STOP_FORCE_PUSHING_CAMILLE"
@@ -42,7 +42,7 @@ jobs:
         id: sync
         shell: bash
         env:
-          FORCE_BUILD: ${{ inputs.force_build || 'false' }}
+          FORCE_BUILD: ${{ (github.event_name == 'push' || inputs.force_build) && 'true' || 'false' }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
