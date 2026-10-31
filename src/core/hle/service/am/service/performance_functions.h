@@ -9,7 +9,7 @@ namespace Service::AM {
 
 class IPerformanceFunctions final : public ServiceFramework<IPerformanceFunctions> {
 public:
-    explicit IPerformanceFunctions(Core::System& system);
+    explicit IPerformanceFunctions(Core::System& core_system);
     ~IPerformanceFunctions() override;
 };
 
