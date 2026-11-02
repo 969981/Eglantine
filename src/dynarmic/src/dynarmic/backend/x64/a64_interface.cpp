@@ -254,15 +254,10 @@ private:
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
-        const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code,
-                       {.define_unpredictable_behaviour = conf.define_unpredictable_behaviour,
-                        .wall_clock_cntpct = conf.wall_clock_cntpct,
-                        .enable_pauth_returns = conf.enable_pauth_returns,
-                        .address_space_bits = conf.page_table_address_space_bits});
+        A64::Translate(ir_block, arch_descriptor, conf);
         Optimization::Optimize(ir_block, conf, polyfill_options);
         return emitter.Emit(ir_block).entrypoint;
     }

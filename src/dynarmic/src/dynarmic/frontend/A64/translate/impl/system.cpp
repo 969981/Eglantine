@@ -34,17 +34,17 @@ enum class SystemRegisterEncoding : u32 {
 };
 
 bool TranslatorVisitor::HINT([[maybe_unused]] Imm<4> CRm, [[maybe_unused]] Imm<3> op2) {
-    if (options.enable_pauth_returns && CRm == 0 && op2 == 7) {
+    if (conf.enable_pauth_returns && CRm == 0 && op2 == 7) {
         return XPAC_1(false, Reg::R30);
     }
     return true;
 }
 
 bool TranslatorVisitor::XPAC_1([[maybe_unused]] bool D, Reg Rd) {
-    if (!options.enable_pauth_returns) {
+    if (!conf.enable_pauth_returns) {
         return UnallocatedEncoding();
     }
-    const auto bits = options.address_space_bits;
+    const auto bits = conf.page_table_address_space_bits;
     if (bits >= 64) {
         return true;
     }
@@ -63,35 +63,35 @@ bool TranslatorVisitor::NOP() {
 }
 
 bool TranslatorVisitor::YIELD() {
-    if (!options.hook_hint_instructions) {
+    if (!conf.hook_hint_instructions) {
         return true;
     }
     return RaiseException(Exception::Yield);
 }
 
 bool TranslatorVisitor::WFE() {
-    if (!options.hook_hint_instructions) {
+    if (!conf.hook_hint_instructions) {
         return true;
     }
     return RaiseException(Exception::WaitForEvent);
 }
 
 bool TranslatorVisitor::WFI() {
-    if (!options.hook_hint_instructions) {
+    if (!conf.hook_hint_instructions) {
         return true;
     }
     return RaiseException(Exception::WaitForInterrupt);
 }
 
 bool TranslatorVisitor::SEV() {
-    if (!options.hook_hint_instructions) {
+    if (!conf.hook_hint_instructions) {
         return true;
     }
     return RaiseException(Exception::SendEvent);
 }
 
 bool TranslatorVisitor::SEVL() {
-    if (!options.hook_hint_instructions) {
+    if (!conf.hook_hint_instructions) {
         return true;
     }
     return RaiseException(Exception::SendEventLocal);
@@ -150,7 +150,7 @@ bool TranslatorVisitor::MRS(Imm<1> o0, Imm<3> op1, Imm<4> CRn, Imm<4> CRm, Imm<3
         return true;
     case SystemRegisterEncoding::CNTPCT_EL0:
         // HACK: Ensure that this is the first instruction in the block it's emitted in, so the cycle count is most up-to-date.
-        if (!ir.block.instructions.empty() && !options.wall_clock_cntpct) {
+        if (!ir.block.instructions.empty() && !conf.wall_clock_cntpct) {
             ir.block.CycleCount()--;
             ir.SetTerm(IR::Term::LinkBlock{*ir.current_location});
             return false;
