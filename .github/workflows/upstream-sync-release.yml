@@ -54,12 +54,58 @@ jobs:
           echo "Local master: $old_sha"
           echo "Eden upstream: $upstream_sha"
           if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
-            # Do not force-push, discard local changes, or silently resolve conflicts.
-            git merge --no-edit --no-ff "$upstream_sha" || {
-              echo "::error::Upstream merge conflict: master has been left unchanged on GitHub."
-              git merge --abort || true
-              exit 1
-            }
+            if ! git merge --no-edit --no-ff "$upstream_sha"; then
+              # One-time compatibility migration for Eden's Dynarmic translator API rewrite.
+              # Only these exact conflicts on the known fork base may be resolved automatically.
+              mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
+              expected=(
+                src/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
+                src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+                src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+              )
+              safe=true
+              if [[ "$old_sha" != "7068de91353234393f4f1e7962f96e0c66c50958" ]] ||
+                 ! git merge-base --is-ancestor "2bec66c0922673844bc761a0784e89cde7869f00" "$upstream_sha" ||
+                 [[ "${#conflicted[@]}" -ne "${#expected[@]}" ]]; then
+                safe=false
+              else
+                for i in "${!expected[@]}"; do
+                  if [[ "${conflicted[i]}" != "${expected[i]}" ]]; then
+                    safe=false
+                  fi
+                done
+              fi
+              if [[ "$safe" != true ]]; then
+                echo "::error::Unexpected merge conflicts; master is unchanged. Resolve manually."
+                printf 'Unmerged: %s\n' "${conflicted[@]}"
+                git merge --abort || true
+                exit 1
+              fi
+              # The upstream translation entry points now accept UserConfig directly,
+              # which contains this fork's PAUTH option and page-table address-space bits.
+              git checkout --theirs -- "${expected[@]}"
+              git add -- "${expected[@]}"
+              python3 - <<'PY'
+          from pathlib import Path
+          system = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp")
+          content = system.read_text()
+          content = content.replace("options.enable_pauth_returns", "conf.enable_pauth_returns")
+          content = content.replace("options.address_space_bits", "conf.page_table_address_space_bits")
+          if "bool TranslatorVisitor::XPAC_1" not in content or "conf.enable_pauth_returns" not in content:
+              raise SystemExit("PAUTH translation extension did not survive the merge")
+          if "options." in content:
+              raise SystemExit("Old TranslationOptions references remain in system.cpp")
+          config = Path("src/dynarmic/src/dynarmic/interface/A64/config.h").read_text()
+          visitor = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h").read_text()
+          if "bool enable_pauth_returns = false;" not in config or "bool XPAC_1" not in visitor:
+              raise SystemExit("PAUTH config or visitor declarations were lost")
+          system.write_text(content)
+          PY
+              git add src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp
+              git diff --cached --check
+              git commit --no-edit
+              echo "::notice::Resolved verified Dynarmic translator migration; other conflicts still fail closed."
+            fi
           fi
           new_sha="$(git rev-parse HEAD)"
           if [ "$new_sha" != "$old_sha" ]; then
