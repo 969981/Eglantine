@@ -107,6 +107,29 @@ jobs:
               echo "::notice::Resolved verified Dynarmic translator migration; other conflicts still fail closed."
             fi
           fi
+          # Dynarmic's current A64 TranslatorVisitor exposes UserConfig as 'conf'.
+          # Older Eglantine PAUTH additions used 'options' and fail to compile on both
+          # Windows and Linux after the upstream translator API migration.
+          python3 - <<'PY'
+          from pathlib import Path
+          branch = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp")
+          config = Path("src/dynarmic/src/dynarmic/interface/A64/config.h")
+          system = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp")
+          source = branch.read_text()
+          legacy = "if (!options.enable_pauth_returns)"
+          if legacy in source:
+              if source.count(legacy) != 1 or "bool enable_pauth_returns = false;" not in config.read_text() or "conf.enable_pauth_returns" not in system.read_text():
+                  raise SystemExit("Cannot safely migrate Dynarmic RETA PAUTH config: unexpected API")
+              branch.write_text(source.replace(legacy, "if (!conf.enable_pauth_returns)"))
+              print("Migrated the outdated RETA PAUTH option to UserConfig conf")
+          if "options.enable_pauth_returns" in branch.read_text():
+              raise SystemExit("Legacy RETA PAUTH options reference remains")
+          PY
+          if ! git diff --quiet -- src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp; then
+            git add src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+            git diff --cached --check
+            git commit -m "fix(dynarmic): adapt PAUTH RETA to UserConfig"
+          fi
           new_sha="$(git rev-parse HEAD)"
           if [ "$new_sha" != "$old_sha" ]; then
             git push origin HEAD:refs/heads/master
