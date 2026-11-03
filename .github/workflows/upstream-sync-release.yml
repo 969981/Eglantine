@@ -4,7 +4,7 @@ name: Sync Eden upstream and release
 
 on:
   schedule:
-    - cron: "23 */6 * * *"
+    - cron: "23,53 * * * *"
   workflow_dispatch:
     inputs:
       force_build:
@@ -278,9 +278,66 @@ jobs:
           path: Eglantine-Linux-x64-Ubuntu26.04.tar.gz
           if-no-files-found: error
 
+  macos:
+    name: Build macOS arm64 (Apple Silicon)
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: macos-15-arm64
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install macOS build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install autoconf automake boost ffmpeg fmt glslang hidapi \
+            libtool libusb lz4 ninja nlohmann-json openssl pkg-config \
+            qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
+            vulkan-loader spirv-tools
+      - name: Configure and compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl@3)"
+          export Qt6_DIR="$(brew --prefix qt@6)/lib/cmake/Qt6"
+          export LIBVULKAN_PATH="$(brew --prefix vulkan-loader)/lib/libvulkan.dylib"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
+            -DENABLE_WERROR=OFF \
+            -DENABLE_QT=ON -DENABLE_QT_TRANSLATION=ON \
+            -DENABLE_UPDATE_CHECKER=OFF -DENABLE_WEB_SERVICE=OFF \
+            -DENABLE_LIBUSB=OFF \
+            -DYUZU_USE_BUNDLED_VCPKG=OFF \
+            -DYUZU_USE_BUNDLED_SIRIT=ON \
+            -DYUZU_USE_EXTERNAL_FFMPEG=ON \
+            -DYUZU_ROOM_STANDALONE=OFF -DYUZU_DISABLE_LLVM=ON
+          cmake --build build --parallel 3
+      - name: Package macOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="build/bin/eden.app"
+          test -s "$app/Contents/MacOS/eden"
+          mkdir -p package
+          cp -R "$app" package/Eglantine.app
+          "$(brew --prefix qt@6)/bin/macdeployqt" package/Eglantine.app -always-overwrite
+          codesign --force --deep --sign - package/Eglantine.app
+          cp LICENSE.txt README.md package/
+          tar -C package -czf Eglantine-macOS-arm64.tar.gz Eglantine.app LICENSE.txt README.md
+          test -s Eglantine-macOS-arm64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eglantine-macOS-arm64
+          path: Eglantine-macOS-arm64.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: [sync, windows, linux]
+    needs: [sync, windows, linux, macos]
     if: always() && needs.sync.outputs.changed == 'true' && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -308,7 +365,8 @@ jobs:
             Source commit: `${{ needs.sync.outputs.sha }}`
             Windows x64: portable ZIP, includes Qt/runtime dependencies.
             Linux x64: Ubuntu 26.04 build (not a portable AppImage).
-            If the Linux build fails, the Windows artifact may still be released.
+            macOS arm64: experimental Apple Silicon app archive (ad-hoc signed).
+            If Linux or macOS builds fail, successful build archives may still be released when Windows succeeds.
           files: release-files/*
           fail_on_unmatched_files: true
           overwrite_files: true
