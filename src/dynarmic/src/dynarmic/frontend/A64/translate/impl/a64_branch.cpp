@@ -71,7 +71,7 @@ bool TranslatorVisitor::RET(Reg Rn) {
 }
 
 bool TranslatorVisitor::RETA([[maybe_unused]] bool M) {
-    if (!options.enable_pauth_returns) {
+    if (!conf.enable_pauth_returns) {
         return UnallocatedEncoding();
     }
     // With SCTLR.EnIA/EnIB clear, authentication leaves LR unchanged.
