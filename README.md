@@ -33,7 +33,7 @@ It's written in C++ with portability in mind, with builds for Windows, Linux, ma
 
 <p align="center">
   <a href="#compatibility">Compatibility</a> |
-  <a href="#development">Development</a> |
+  <a href="#contribute">Contribute</a> |
   <a href="#building">Building</a> |
   <a href="#download">Download</a> |
   <a href="#support">Support</a> |
