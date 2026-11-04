@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: eglantine-upstream-sync
+  group: eglantine-upstream-sync-runnerfix-v2
   cancel-in-progress: false
 
 jobs:
@@ -282,7 +282,8 @@ jobs:
     name: Build macOS arm64 (Apple Silicon)
     needs: sync
     if: needs.sync.outputs.changed == 'true'
-    runs-on: macos-15-arm64
+    # GitHub's standard Apple Silicon label is macos-15 (not macos-15-arm64).
+    runs-on: macos-15
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
