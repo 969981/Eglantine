@@ -1,0 +1,97 @@
+# Keep the historical Eglantine branches intact while tracking Lichii's Switch 2 work.
+# This scheduled workflow is active once nx2 is selected as the repository default branch.
+name: Sync Lichii nx2 upstream and dispatch builds
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Dispatch a build even if Lichii nx2 did not change"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: lichii-nx2-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Safe non-force merge of zortos293/Lichii nx2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      source: ${{ steps.sync.outputs.source }}
+      merged: ${{ steps.sync.outputs.merged }}
+    steps:
+      - name: Check out our nx2 branch, with full history
+        uses: actions/checkout@v4
+        with:
+          ref: nx2
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          persist-credentials: true
+      - name: Fetch Lichii nx2 and merge without rewriting local history
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin nx2
+          git switch -C nx2 origin/nx2
+          git remote add lichii https://github.com/zortos293/Lichii.git
+          git fetch --no-tags lichii refs/heads/nx2
+          before="$(git rev-parse HEAD)"
+          upstream="$(git rev-parse FETCH_HEAD)"
+          echo "Lichii upstream: $upstream"
+          echo "Local nx2 before sync: $before"
+          echo "source=$upstream" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Lichii nx2 is already included; no merge required."
+          else
+            if ! git merge --no-edit --no-ff "$upstream"; then
+              git merge --abort || true
+              echo "::error::Lichii nx2 merge conflict: review manually; no local branch was overwritten."
+              exit 1
+            fi
+            # A normal non-force push retains all previous Eglantine and local nx2 commits.
+            git push origin HEAD:refs/heads/nx2
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          merged="$(git rev-parse HEAD)"
+          echo "merged=$merged" >> "$GITHUB_OUTPUT"
+          {
+            echo "Lichii nx2 source: $upstream"
+            echo "Local nx2 merged commit: $merged"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  trigger-build:
+    name: Build nx2 release after update, once nx2 is default
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch the nx2 release matrix
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/$GH_REPO" --jq '.default_branch')"
+          if [ "$default_branch" != "nx2" ]; then
+            echo "::notice::Set the repository default branch to nx2 in Settings > General before workflow_dispatch can run the nx2-only release workflow."
+            echo "The nx2 source branch was updated; no build was triggered because default is $default_branch." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh workflow run release-binaries.yml --ref nx2 -f publish_release=true
+          echo "Dispatched the upstream Lichii multi-platform build from nx2." >> "$GITHUB_STEP_SUMMARY"
