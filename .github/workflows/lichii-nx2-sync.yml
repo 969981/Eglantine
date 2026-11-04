@@ -57,11 +57,35 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Lichii nx2 is already included; no merge required."
           else
-            if ! git merge --no-edit --no-ff "$upstream"; then
-              git merge --abort || true
-              echo "::error::Lichii nx2 merge conflict: review manually; no local branch was overwritten."
-              exit 1
+            # Preserve local workflow files: automatic GitHub App pushes cannot safely
+            # update .github/workflows without an explicit workflows grant. Upstream
+            # workflow changes are reviewed/applied separately through the GitHub connector.
+            if ! git merge --no-commit --no-ff "$upstream"; then
+              mapfile -d '' -t conflicted < <(git diff --name-only -z --diff-filter=U)
+              if [ "${#conflicted[@]}" -eq 0 ]; then
+                git merge --abort || true
+                echo "::error::Upstream merge failed for reasons other than file conflicts."
+                exit 1
+              fi
+              for path in "${conflicted[@]}"; do
+                case "$path" in
+                  .github/workflows/*)
+                    git checkout --ours -- "$path"
+                    git add -- "$path"
+                    ;;
+                  *)
+                    git merge --abort || true
+                    echo "::error::Source conflict in $path; nx2 was not pushed."
+                    exit 1
+                    ;;
+                esac
+              done
             fi
+            while IFS= read -r -d '' added; do
+              git rm -f -- "$added"
+            done < <(git diff --cached --name-only -z --diff-filter=A -- .github/workflows/)
+            git restore --source=HEAD --staged --worktree -- .github/workflows/
+            git commit -m "Merge Lichii nx2 (retain reviewed local GitHub workflows)"
             # A normal non-force push retains all previous Eglantine and local nx2 commits.
             git push origin HEAD:refs/heads/nx2
             echo "changed=true" >> "$GITHUB_OUTPUT"
