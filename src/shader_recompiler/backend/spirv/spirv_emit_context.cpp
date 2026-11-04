@@ -257,6 +257,10 @@ std::string_view StageName(Stage stage) {
         return "fs";
     case Stage::Compute:
         return "cs";
+    case Stage::Task:
+        return "ts";
+    case Stage::Mesh:
+        return "ms";
     }
     throw InvalidArgument("Invalid stage {}", stage);
 }
@@ -307,6 +311,9 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     const Id struct_type{ctx.TypeStruct(array_type)};
     ctx.Decorate(struct_type, spv::Decoration::Block);
     ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    if (info.requires_coherent_global_memory) {
+        ctx.MemberDecorate(struct_type, 0, spv::Decoration::Coherent);
+    }
 
     const Id struct_pointer{ctx.TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
     type_def.array = struct_pointer;
@@ -464,6 +471,8 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
                          IR::Program& program, Bindings& bindings)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
+      requires_coherent_global_memory{program.info.requires_coherent_global_memory},
+      requires_coherent_image_memory{program.info.requires_coherent_image_memory},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
@@ -475,6 +484,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineCommonTypes(program.info);
     DefineCommonConstants();
     DefineInterfaces(program);
+    DefineMesh(program);
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
@@ -949,25 +959,16 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                                auto&& callback) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
-        for (size_t index = 0; index < num_buffers; ++index) {
-            if (!info.nvn_buffer_used[index]) {
-                continue;
-            }
+        const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+        const auto base_address{[&](size_t index) {
             const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id ssbo_addr_cbuf_offset{Const(ssbo.cbuf_offset / 8)};
-            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
-            const Id ssbo_addr_pointer{OpAccessChain(
-                uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero, ssbo_addr_cbuf_offset)};
-            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
-                                                     zero, ssbo_size_cbuf_offset)};
-
-            const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+            const Id ssbo_addr_pointer{OpAccessChain(uniform_types.U32x2,
+                                                     cbufs[ssbo.cbuf_index].U32x2, zero,
+                                                     Const(ssbo.cbuf_offset / 8))};
             const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
-            const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
-            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
-            const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
-            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
-                                       OpULessThan(U1, addr, ssbo_end))};
+            return OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask));
+        }};
+        const auto access{[&](size_t index, Id ssbo_addr, Id cond) {
             const Id then_label{OpLabel()};
             const Id else_label{OpLabel()};
             OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
@@ -979,6 +980,41 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
             callback(ssbo_pointer);
             AddLabel(else_label);
+        }};
+        if (info.native_global_bounds) {
+            // Native pointers carry no NVN size word. The address belongs to the candidate buffer
+            // whose base is the closest one at or below it (bounds come from the binding).
+            std::vector<Id> bases(num_buffers);
+            Id best_index{Const(~0U)};
+            Id best_distance{Constant(U64, ~u64{0})};
+            for (size_t index = 0; index < num_buffers; ++index) {
+                bases[index] = base_address(index);
+                const Id distance{OpISub(U64, addr, bases[index])};
+                const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
+                                             OpULessThan(U1, distance, best_distance))};
+                best_distance = OpSelect(U64, better, distance, best_distance);
+                best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
+            }
+            for (size_t index = 0; index < num_buffers; ++index) {
+                access(index, bases[index],
+                       OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
+            }
+            return;
+        }
+        for (size_t index = 0; index < num_buffers; ++index) {
+            if (!info.nvn_buffer_used[index]) {
+                continue;
+            }
+            const auto& ssbo{info.storage_buffers_descriptors[index]};
+            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
+            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
+                                                     zero, ssbo_size_cbuf_offset)};
+            const Id ssbo_addr{base_address(index)};
+            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
+            const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
+            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
+                                       OpULessThan(U1, addr, ssbo_end))};
+            access(index, ssbo_addr, cond);
         }
     }};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
@@ -1359,6 +1395,9 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "imgbuf"));
+        if (info.requires_coherent_image_memory) {
+            Decorate(id, spv::Decoration::Coherent);
+        }
         image_buffers.push_back({
             .id = id,
             .image_type = image_type,
@@ -1414,6 +1453,9 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "img"));
+        if (info.requires_coherent_image_memory) {
+            Decorate(id, spv::Decoration::Coherent);
+        }
         images.push_back({
             .id = id,
             .image_type = image_type,
@@ -1491,6 +1533,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (loads[IR::Attribute::PrimitiveId]) {
         primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
         if (stage == Stage::Fragment) {
+            // A fragment PrimitiveId input requires Geometry (geometryShader is a required feature).
+            AddCapability(spv::Capability::Geometry);
             Decorate(primitive_id, spv::Decoration::Flat);
         }
     }
@@ -1522,34 +1566,40 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             }
         }
     }
+    // BaseInstance, BaseVertex and DrawIndex are only valid with the DrawParameters capability.
+    const auto define_draw_parameter{[this](spv::BuiltIn builtin) {
+        AddExtension("SPV_KHR_shader_draw_parameters");
+        AddCapability(spv::Capability::DrawParameters);
+        return DefineInput(*this, U32[1], true, builtin);
+    }};
     if (loads[IR::Attribute::InstanceId]) {
         if (profile.support_vertex_instance_id) {
             instance_id = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceId);
             if (loads[IR::Attribute::BaseInstance]) {
-                base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+                base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
             }
         } else {
             instance_index = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceIndex);
-            base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+            base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
         }
     } else if (loads[IR::Attribute::BaseInstance]) {
-        base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+        base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
     }
     if (loads[IR::Attribute::VertexId]) {
         if (profile.support_vertex_instance_id) {
             vertex_id = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexId);
             if (loads[IR::Attribute::BaseVertex]) {
-                base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+                base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
             }
         } else {
             vertex_index = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexIndex);
-            base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+            base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
         }
     } else if (loads[IR::Attribute::BaseVertex]) {
-        base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+        base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
     }
     if (loads[IR::Attribute::DrawID]) {
-        draw_index = DefineInput(*this, U32[1], true, spv::BuiltIn::DrawIndex);
+        draw_index = define_draw_parameter(spv::BuiltIn::DrawIndex);
     }
     if (loads[IR::Attribute::FrontFace]) {
         front_face = DefineInput(*this, U1, true, spv::BuiltIn::FrontFacing);
@@ -1586,6 +1636,16 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         }
         const bool is_integer = input_type == AttributeType::SignedInt ||
                                 input_type == AttributeType::UnsignedInt;
+        if (runtime_info.per_primitive_generics.test(index)) {
+            // Written per primitive by a mesh program: constant over the primitive.
+            AddExtension("SPV_EXT_mesh_shader");
+            AddCapability(spv::Capability::MeshShadingEXT);
+            Decorate(id, spv::Decoration::PerPrimitiveEXT);
+            if (is_integer) {
+                Decorate(id, spv::Decoration::Flat);
+            }
+            continue;
+        }
         if (is_integer) {
             Decorate(id, spv::Decoration::Flat);
         } else {
@@ -1614,8 +1674,120 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     }
 }
 
+void EmitContext::DefineMesh(const IR::Program& program) {
+    if (stage != Stage::Task && stage != Stage::Mesh) {
+        return;
+    }
+    AddExtension("SPV_EXT_mesh_shader");
+    AddCapability(spv::Capability::MeshShadingEXT);
+    mesh_info = program.mesh;
+    mesh_threads = program.workgroup_size[0];
+    // The task's output region, which its mesh workgroups read as their input region.
+    const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
+    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
+                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
+    Name(mesh_payload, "task_payload");
+    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+    if (stage == Stage::Task) {
+        return;
+    }
+    // Output attribute region: groups of 32 vertices, then groups of 32 primitives, one 32-word
+    // line per attribute. The map region keeps one map byte per word.
+    const u32 vertex_lines{static_cast<u32>(mesh_info.vertex_lines.size())};
+    const u32 primitive_lines{static_cast<u32>(mesh_info.primitive_lines.size())};
+    mesh_primitive_base = Common::DivCeil(mesh_info.max_vertices, 32U) * vertex_lines * 32;
+    mesh_attribute_words = (std::max)(
+        mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
+        1U);
+    mesh_map_bytes = 4 + 3 * mesh_info.max_primitives;
+    mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+    mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
+                                     std::nullopt, spv::StorageClass::Workgroup);
+    Name(mesh_attributes, "isbe_attributes");
+    mesh_map = DefineVariable(*this, TypeArray(U32[1], Const(mesh_map_bytes)), std::nullopt,
+                              spv::StorageClass::Workgroup);
+    Name(mesh_map, "isbe_map");
+    mesh_primitive_count =
+        DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+    Name(mesh_primitive_count, "isbe_primitive_count");
+
+    const Id vertex_count{Const(mesh_info.max_vertices)};
+    const Id primitive_count{Const(mesh_info.max_primitives)};
+    mesh_primitive_indices =
+        DefineVariable(*this, TypeArray(U32[3], primitive_count),
+                       spv::BuiltIn::PrimitiveTriangleIndicesEXT, spv::StorageClass::Output);
+    std::array<Id, IR::NUM_GENERICS> generics[2]{};
+    Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
+        if (!Sirit::ValidId(variable)) {
+            variable = DefineVariable(*this, TypeArray(U32[1], primitive_count), builtin,
+                                      spv::StorageClass::Output);
+            Decorate(variable, spv::Decoration::PerPrimitiveEXT);
+        }
+        return MeshLineTarget{variable, ~0U, false};
+    };
+    const auto target = [&](u32 line, bool per_primitive) -> MeshLineTarget {
+        const IR::Attribute attribute{line};
+        if (IR::IsGeneric(attribute)) {
+            const u32 index{IR::GenericAttributeIndex(attribute)};
+            Id& variable{generics[per_primitive][index]};
+            if (!Sirit::ValidId(variable)) {
+                variable = DefineVariable(
+                    *this, TypeArray(F32[4], per_primitive ? primitive_count : vertex_count),
+                    std::nullopt, spv::StorageClass::Output);
+                Decorate(variable, spv::Decoration::Location, index);
+                if (per_primitive) {
+                    Decorate(variable, spv::Decoration::PerPrimitiveEXT);
+                }
+            }
+            return {variable, IR::GenericAttributeElement(attribute), true};
+        }
+        if (per_primitive) {
+            switch (attribute) {
+            case IR::Attribute::PrimitiveId:
+                return per_primitive_builtin(primitive_id_output, spv::BuiltIn::PrimitiveId);
+            case IR::Attribute::Layer:
+                return per_primitive_builtin(primitive_layer, spv::BuiltIn::Layer);
+            case IR::Attribute::ViewportIndex:
+                return per_primitive_builtin(primitive_viewport, spv::BuiltIn::ViewportIndex);
+            default:
+                return {};
+            }
+        }
+        switch (attribute) {
+        case IR::Attribute::PositionX:
+        case IR::Attribute::PositionY:
+        case IR::Attribute::PositionZ:
+        case IR::Attribute::PositionW:
+            if (!Sirit::ValidId(output_position)) {
+                output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
+                                                 spv::BuiltIn::Position, spv::StorageClass::Output);
+            }
+            return {output_position,
+                    static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
+        case IR::Attribute::PointSize:
+            if (!Sirit::ValidId(point_size)) {
+                point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count),
+                                            spv::BuiltIn::PointSize, spv::StorageClass::Output);
+            }
+            return {point_size, ~0U, true};
+        default:
+            return {}; // per-primitive values in vertex lines have no vertex output
+        }
+    };
+    for (const u32 line : mesh_info.vertex_lines) {
+        mesh_vertex_targets.push_back(target(line, false));
+    }
+    for (const u32 line : mesh_info.primitive_lines) {
+        mesh_primitive_targets.push_back(target(line, true));
+    }
+}
+
 void EmitContext::DefineOutputs(const IR::Program& program) {
     const Info& info{program.info};
+    if (stage == Stage::Task || stage == Stage::Mesh) {
+        return; // DefineMesh
+    }
     const std::optional<u32> invocations{program.invocations};
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {

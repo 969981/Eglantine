@@ -5,7 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string_view>
 #include "common/logging.h"
 #include "common/random.h"
@@ -76,6 +81,24 @@ struct PatchCollection {
 
 namespace {
 
+FileSys::VirtualDir FindLooseRomFSDirectory(const FileSys::VirtualDir& parent) {
+    if (parent == nullptr) {
+        return nullptr;
+    }
+    if (const auto dir = parent->GetSubdirectory("romfs")) {
+        return dir;
+    }
+    for (const auto& dir : parent->GetSubdirectories()) {
+        const auto name = dir->GetName();
+        if (name.size() == 5 && std::equal(name.begin(), name.end(), "romfs", [](char a, char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == b;
+            })) {
+            return dir;
+        }
+    }
+    return nullptr;
+}
+
 // RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
 // the exefs/ directory (the usual layout of an extracted title).
 FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
@@ -88,41 +111,70 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
         }
     }
     if (const auto parent = exefs_dir->GetParentDirectory()) {
-        if (const auto romfs_dir = parent->GetSubdirectory("romfs")) {
+        if (const auto romfs_dir = FindLooseRomFSDirectory(parent)) {
+            // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
+            // MiB), so loaders of the same directory share one build while any of them holds it.
+            static std::mutex cache_mutex;
+            static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
+            std::scoped_lock lk{cache_mutex};
+            auto& cached = cache[romfs_dir->GetFullPath()];
+            if (auto built = cached.lock()) {
+                return built;
+            }
             LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
-            return FileSys::CreateRomFS(romfs_dir);
+            const auto started = std::chrono::steady_clock::now();
+            auto built = FileSys::CreateRomFS(romfs_dir);
+            LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count());
+            cached = built;
+            return built;
         }
     }
     return nullptr;
 }
 
-// The display version of a dump without control data, from its RomFS: Nintendo EPD titles name
-// their resource size tables after it (System/Resource/ResourceSizeTable.Product.180.* in Mario
-// Kart World 1.8.0). A hotfix can keep its minor version's tables (Product.110 in a 1.1.1).
-std::string RomFSProductVersion(const FileSys::VirtualDir& romfs_dir) {
-    if (romfs_dir == nullptr) {
-        return {};
-    }
-    const auto system_dir = romfs_dir->GetSubdirectory("System");
-    const auto resource_dir = system_dir != nullptr ? system_dir->GetSubdirectory("Resource") : nullptr;
-    if (resource_dir == nullptr) {
-        return {};
-    }
-    constexpr std::string_view Prefix = "ResourceSizeTable.Product.";
+// The newest three-digit tag in a directory's file names of the form <prefix>NNN.<anything>.
+std::string NewestProductTag(const FileSys::VirtualDir& dir, std::string_view prefix) {
     std::string best;
-    for (const auto& file : resource_dir->GetFiles()) {
+    if (dir == nullptr) {
+        return best;
+    }
+    for (const auto& file : dir->GetFiles()) {
         const std::string file_name = file->GetName();
-        if (!file_name.starts_with(Prefix) || file_name.size() < Prefix.size() + 4) {
+        if (!file_name.starts_with(prefix) || file_name.size() < prefix.size() + 4) {
             continue;
         }
-        const std::string_view digits = std::string_view{file_name}.substr(Prefix.size(), 3);
-        if (file_name[Prefix.size() + 3] != '.' ||
+        const std::string_view digits = std::string_view{file_name}.substr(prefix.size(), 3);
+        if (file_name[prefix.size() + 3] != '.' ||
             !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; })) {
             continue;
         }
         if (std::string version{digits}; version > best) {
             best = version;
         }
+    }
+    return best;
+}
+
+// The display version of a dump without control data, from its RomFS: Nintendo EPD titles name
+// their resource size tables after it (System/Resource/ResourceSizeTable.Product.180.* in Mario
+// Kart World 1.8.0), and some name their game data list instead (GameData/GameDataList.Product.320.*
+// in Donkey Kong Bananza 3.2.0). A hotfix can keep its minor version's tables (Product.110 in a
+// 1.1.1).
+std::string RomFSProductVersion(const FileSys::VirtualDir& romfs_dir) {
+    if (romfs_dir == nullptr) {
+        return {};
+    }
+    const auto system_dir = romfs_dir->GetSubdirectory("System");
+    std::string best = NewestProductTag(
+        system_dir != nullptr ? system_dir->GetSubdirectory("Resource") : nullptr,
+        "ResourceSizeTable.Product.");
+    if (const auto game_data = NewestProductTag(romfs_dir->GetSubdirectory("GameData"),
+                                                "GameDataList.Product.");
+        game_data > best) {
+        best = game_data;
     }
     if (best.empty()) {
         return {};
@@ -131,9 +183,17 @@ std::string RomFSProductVersion(const FileSys::VirtualDir& romfs_dir) {
 }
 
 // Loose ExeFS dumps carry no control data, but icon/nacp sidecars can be dropped next to the
-// ExeFS or in the game folder above it (<game>/exefs/main and
+// ExeFS or in the game folder above it (<game>/exefs/main, <game>/base/exefs/main and
 // <game>/updates/<title id>/exefs/main layouts).
 std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exefs_dir) {
+    const auto equals_ignore_case = [](const std::string& a, std::string_view b) {
+        return a.size() == b.size() &&
+               std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+                   return std::tolower(static_cast<unsigned char>(x)) ==
+                          std::tolower(static_cast<unsigned char>(y));
+               });
+    };
+
     std::vector<FileSys::VirtualDir> dirs{exefs_dir};
     for (auto dir = exefs_dir; dirs.size() < 4;) {
         const auto parent = dir->GetParentDirectory();
@@ -142,10 +202,11 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
         }
         const auto& name = parent->GetName();
         dirs.push_back(parent);
-        const bool title_id_like =
-            name == "updates" ||
+        const bool storage_level =
+            equals_ignore_case(name, "base") || equals_ignore_case(name, "update") ||
+            equals_ignore_case(name, "updates") ||
             (!name.empty() && name.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos);
-        if (!title_id_like) {
+        if (!storage_level) {
             break;
         }
         dir = parent;
@@ -223,9 +284,9 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
         name = control->GetApplicationName();
     }
 
-    romfs = FindLooseRomFS(file_dir);
+    romfs_exefs_dir = file_dir;
     if (const auto title_dir = file_dir->GetParentDirectory()) {
-        romfs_version = RomFSProductVersion(title_dir->GetSubdirectory("romfs"));
+        romfs_version = RomFSProductVersion(FindLooseRomFSDirectory(title_dir));
     }
 }
 
@@ -235,7 +296,17 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
     , dir(std::move(directory))
     , override_update(override_update_)
 {
-    romfs = FindLooseRomFS(dir);
+    romfs_exefs_dir = dir;
+}
+
+// Loaders made only for metadata (the game list, title lookups) never need the RomFS, and several
+// of them were alive with a whole copy each.
+const FileSys::VirtualFile& AppLoader_DeconstructedRomDirectory::LooseRomFS() {
+    if (!romfs_resolved) {
+        romfs_resolved = true;
+        romfs = FindLooseRomFS(romfs_exefs_dir);
+    }
+    return romfs;
 }
 
 FileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile& dir_file) {
@@ -294,7 +365,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 
     // Loose-ExeFS loads bypass the NCA/NSP loaders, which are the ones that normally apply
     // LayeredFS to the RomFS; apply it here so mods in user/load/<titleid>/ work too.
-    if (romfs != nullptr) {
+    if (LooseRomFS() != nullptr) {
         const FileSys::PatchManager patch_manager(metadata.GetTitleID(),
                                                   system.GetFileSystemController(),
                                                   system.GetContentProvider());
@@ -404,7 +475,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 }
 
 ResultStatus AppLoader_DeconstructedRomDirectory::ReadRomFS(FileSys::VirtualFile& out_dir) {
-    if (romfs == nullptr) {
+    if (LooseRomFS() == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }
 

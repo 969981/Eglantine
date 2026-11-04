@@ -82,6 +82,26 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
 
+# Handle specific -Werror downgrades safely across platforms
+if(ENABLE_WERROR)
+    if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(CMAKE_C_FLAGS MATCHES "-Werror=unused")
+            string(REPLACE "-Werror=unused" "-Wno-error=unused" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+        endif()
+        if(CMAKE_CXX_FLAGS MATCHES "-Werror=unused")
+            string(REPLACE "-Werror=unused" "-Wno-error=unused" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+        endif()
+
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=unused -Wno-error=unused-function")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=unused -Wno-error=unused-function")
+    elseif(MSVC)
+        # Windows Specifically
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4100 /wd4101")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4100 /wd4101")
+    endif()
+endif()
+
+
 # Lossless Scaling frame generation. Only Android.
 option(ENABLE_LSFG "Enable frame generation (LSFG and FSR 3 Fluid Motion)" ON)
 
@@ -293,7 +313,7 @@ if (ANDROID AND YUZU_DOWNLOAD_ANDROID_VVL)
 endif()
 
 if(EXISTS ${PROJECT_SOURCE_DIR}/hooks/pre-commit AND NOT EXISTS ${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit)
-    if (EXISTS ${PROJECT_SOURCE_DIR}/.git/)
+    if (IS_DIRECTORY ${PROJECT_SOURCE_DIR}/.git)
         message(STATUS "Copying pre-commit hook")
         file(COPY hooks/pre-commit DESTINATION ${PROJECT_SOURCE_DIR}/.git/hooks)
     endif()
@@ -443,6 +463,9 @@ if (lz4_ADDED)
 endif()
 
 # zstd
+# Always bundled: NUP archives are only byte-identical across platforms when every build
+# compresses with the same zstd version.
+set(zstd_FORCE_BUNDLED ON)
 AddJsonPackage(zstd)
 
 if (zstd_ADDED)
@@ -617,7 +640,7 @@ if (ENABLE_QT)
     ## Components ##
 
     # Best practice is to ask for all components at once, so they are from the same version
-    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui)
+    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network)
     if (LINUX OR FREEBSD)
         list(APPEND YUZU_QT_COMPONENTS DBus)
         # yes Qt, we get it
@@ -729,15 +752,16 @@ endif()
 
 # TODO: Icon/install handling n such should be put into dist/CMakeLists.txt
 if(ENABLE_QT AND UNIX AND NOT APPLE)
-    install(FILES "dist/dev.eden_emu.eden.desktop"
+    install(FILES "dist/io.github.zortos293.lichii.desktop"
         DESTINATION "share/applications")
-    install(FILES "dist/dev.eden_emu.eden.svg"
-        DESTINATION "share/icons/hicolor/scalable/apps")
+    install(FILES "dist/lichii.png"
+        DESTINATION "share/icons/hicolor/256x256/apps"
+        RENAME "io.github.zortos293.lichii.png")
 
     # TODO: these files need to be updated.
     install(FILES "dist/dev.eden_emu.eden.xml"
         DESTINATION "share/mime/packages")
-    install(FILES "dist/dev.eden_emu.eden.metainfo.xml"
+    install(FILES "dist/io.github.zortos293.lichii.metainfo.xml"
         DESTINATION "share/metainfo")
 endif()
 

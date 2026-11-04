@@ -317,6 +317,9 @@ EmitContext::EmitContext(IR::Program& program, Bindings& bindings, const Profile
             header += "layout(early_fragment_tests)in;";
         }
         break;
+    case Stage::Task:
+    case Stage::Mesh:
+        throw NotImplementedException("GLSL task and mesh programs");
     case Stage::Compute:
         stage_name = "cs";
         const u32 local_x{(std::max)(program.workgroup_size[0], 1u)};
@@ -470,8 +473,10 @@ void EmitContext::DefineStorageBuffers(Bindings& bindings) {
     }
     u32 index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
-        header += fmt::format("layout(std430,binding={}) buffer {}_ssbo_{}{{uint {}_ssbo{}[];}};",
-                              bindings.storage_buffer, stage_name, bindings.storage_buffer,
+        header += fmt::format("layout(std430,binding={}) {}buffer {}_ssbo_{}{{uint {}_ssbo{}[];}};",
+                              bindings.storage_buffer,
+                              info.requires_coherent_global_memory ? "coherent " : "",
+                              stage_name, bindings.storage_buffer,
                               stage_name, index);
         bindings.storage_buffer += desc.count;
         index += desc.count;
@@ -659,14 +664,16 @@ std::string EmitContext::DefineGlobalMemoryFunctions() {
 }
 
 void EmitContext::SetupImages(Bindings& bindings) {
+    const std::string_view coherent{info.requires_coherent_image_memory ? "coherent " : ""};
     image_buffers.reserve(info.image_buffer_descriptors.size());
     for (const auto& desc : info.image_buffer_descriptors) {
         image_buffers.push_back({bindings.image, desc.count});
         const auto format{ImageFormatString(desc.format)};
         const auto qualifier{ImageAccessQualifier(desc.is_written, desc.is_read)};
         const auto array_decorator{desc.count > 1 ? fmt::format("[{}]", desc.count) : ""};
-        header += fmt::format("layout(binding={}{}) uniform {}uimageBuffer img{}{};",
-                              bindings.image, format, qualifier, bindings.image, array_decorator);
+        header += fmt::format("layout(binding={}{}) uniform {}{}uimageBuffer img{}{};",
+                              bindings.image, format, coherent, qualifier, bindings.image,
+                              array_decorator);
         bindings.image += desc.count;
     }
     images.reserve(info.image_descriptors.size());
@@ -676,8 +683,8 @@ void EmitContext::SetupImages(Bindings& bindings) {
         const auto image_type{ImageType(desc.type)};
         const auto qualifier{ImageAccessQualifier(desc.is_written, desc.is_read)};
         const auto array_decorator{desc.count > 1 ? fmt::format("[{}]", desc.count) : ""};
-        header += fmt::format("layout(binding={}{})uniform {}{} img{}{};", bindings.image, format,
-                              qualifier, image_type, bindings.image, array_decorator);
+        header += fmt::format("layout(binding={}{})uniform {}{}{} img{}{};", bindings.image, format,
+                              coherent, qualifier, image_type, bindings.image, array_decorator);
         bindings.image += desc.count;
     }
 }

@@ -58,6 +58,10 @@ void EmitGetAttributeIndexed(EmitContext& ctx, IR::Inst& inst, ScalarS32 offset,
 void EmitSetAttributeIndexed(EmitContext& ctx, ScalarU32 offset, ScalarF32 value, ScalarU32 vertex);
 void EmitGetPatch(EmitContext& ctx, IR::Inst& inst, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, ScalarF32 value);
+void EmitIsbeRead(EmitContext& ctx);
+void EmitIsbeWriteAttribute(EmitContext& ctx);
+void EmitIsbeWriteMapU8(EmitContext& ctx);
+void EmitIsbeWriteMapU32(EmitContext& ctx);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, ScalarF32 value);
 void EmitSetSampleMask(EmitContext& ctx, ScalarS32 value);
 void EmitSetFragDepth(EmitContext& ctx, ScalarF32 value);
@@ -673,5 +677,8 @@ void EmitDPdxFine(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
 void EmitDPdyFine(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
 void EmitDPdxCoarse(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
 void EmitDPdyCoarse(EmitContext& ctx, IR::Inst& inst, ScalarF32 op_a);
+
+void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a,
+                      const IR::Value& b, const IR::Value& c);
 
 } // namespace Shader::Backend::GLASM

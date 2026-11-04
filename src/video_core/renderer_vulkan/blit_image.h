@@ -82,6 +82,22 @@ public:
                    VkImage src_image, VkSampler src_sampler, const Region2D& dst_region,
                    const Region2D& src_region, const Extent3D& src_size);
 
+    /// Temporal upscale (temporal_upscale.frag) into dst_framebuffer: the jittered input colour,
+    /// accumulated with the history image reprojected along the motion vectors. The result is also
+    /// stored to next_history (a storage image of the output's size).
+    void TemporalUpscale(const Framebuffer* dst_framebuffer, const ImageView& input_color,
+                         const ImageView& motion_vectors, VkImageView history,
+                         VkImageView next_history, const Region2D& dst_region,
+                         std::array<f32, 2> jitter,
+                         std::array<f32, 2> motion_scale, f32 current_weight,
+                         f32 kernel_scale, f32 clip_width, f32 clip_motion,
+                         f32 kernel_motion);
+
+    /// RCAS (temporal_sharpen.frag) of source into dst_framebuffer; sharpness in stops as
+    /// FsrRcasCon takes it (0 is the strongest).
+    void TemporalSharpen(const Framebuffer* dst_framebuffer, VkImageView source,
+                         const Region2D& dst_region, f32 sharpness);
+
     void BlitColorMSAA(const Framebuffer* dst_framebuffer, const ImageView& src_image_view,
                        const Region2D& dst_region, const Region2D& src_region);
 
@@ -108,6 +124,10 @@ public:
     void ConvertR16ToD16(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
 
     void ConvertABGR8ToD24S8(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
+
+    void ConvertABGR8ToX8D24(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
+
+    void ConvertX8D24ToABGR8(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
 
     void ConvertABGR8ToD32F(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
 
@@ -170,6 +190,9 @@ private:
 
     [[nodiscard]] VkPipeline FindOrEmplaceColorPipeline(const BlitImagePipelineKey& key);
 
+    [[nodiscard]] VkPipeline FindOrEmplaceTemporalUpscalePipeline(VkRenderPass renderpass);
+    [[nodiscard]] VkPipeline FindOrEmplaceTemporalSharpenPipeline(VkRenderPass renderpass);
+
     [[nodiscard]] VkPipeline FindOrEmplaceDepthStencilPipeline(const BlitImagePipelineKey& key);
 
     [[nodiscard]] VkPipeline FindOrEmplaceClearColorPipeline(const BlitImagePipelineKey& key);
@@ -207,15 +230,22 @@ private:
 
     vk::DescriptorSetLayout one_texture_set_layout;
     vk::DescriptorSetLayout two_textures_set_layout;
+    vk::DescriptorSetLayout temporal_upscale_set_layout;
     DescriptorAllocator one_texture_descriptor_allocator;
     DescriptorAllocator two_textures_descriptor_allocator;
+    DescriptorAllocator temporal_upscale_descriptor_allocator;
     vk::PipelineLayout one_texture_pipeline_layout;
     vk::PipelineLayout two_textures_pipeline_layout;
+    vk::PipelineLayout temporal_upscale_pipeline_layout;
+    vk::PipelineLayout temporal_sharpen_pipeline_layout;
     vk::PipelineLayout clear_color_pipeline_layout;
     vk::PipelineLayout msaa_copy_pipeline_layout;
     vk::PipelineLayout msaa_copy_depth_stencil_pipeline_layout;
     vk::ShaderModule full_screen_vert;
     vk::ShaderModule blit_color_to_color_frag;
+    vk::ShaderModule temporal_upscale_frag;
+    vk::ShaderModule temporal_sharpen_frag;
+    vk::ShaderModule blit_color_srgb_to_linear_frag;
     vk::ShaderModule blit_color_msaa_frag;
     vk::ShaderModule blit_depth_stencil_frag;
     vk::ShaderModule blit_depth_frag;
@@ -227,6 +257,8 @@ private:
     vk::ShaderModule convert_depth_to_float_frag;
     vk::ShaderModule convert_float_to_depth_frag;
     vk::ShaderModule convert_abgr8_to_d24s8_frag;
+    vk::ShaderModule convert_abgr8_to_x8d24_frag;
+    vk::ShaderModule convert_x8d24_to_abgr8_frag;
     vk::ShaderModule convert_abgr8_to_d32f_frag;
     vk::ShaderModule convert_d32f_to_abgr8_frag;
     vk::ShaderModule convert_d24s8_to_abgr8_frag;
@@ -246,6 +278,10 @@ private:
 
     std::vector<BlitImagePipelineKey> blit_color_keys;
     std::vector<vk::Pipeline> blit_color_pipelines;
+    std::vector<VkRenderPass> temporal_upscale_keys;
+    std::vector<vk::Pipeline> temporal_upscale_pipelines;
+    std::vector<VkRenderPass> temporal_sharpen_keys;
+    std::vector<vk::Pipeline> temporal_sharpen_pipelines;
     std::vector<BlitImagePipelineKey> blit_depth_stencil_keys;
     std::vector<vk::Pipeline> blit_depth_stencil_pipelines;
     std::vector<BlitImagePipelineKey> clear_color_keys;
@@ -282,6 +318,8 @@ private:
     vk::Pipeline convert_d16_to_r16_pipeline;
     vk::Pipeline convert_r16_to_d16_pipeline;
     vk::Pipeline convert_abgr8_to_d24s8_pipeline;
+    vk::Pipeline convert_abgr8_to_x8d24_pipeline;
+    vk::Pipeline convert_x8d24_to_abgr8_pipeline;
     vk::Pipeline convert_abgr8_to_d32f_pipeline;
     vk::Pipeline convert_d32f_to_abgr8_pipeline;
     vk::Pipeline convert_d24s8_to_abgr8_pipeline;

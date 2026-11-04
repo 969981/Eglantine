@@ -15,6 +15,7 @@ enum class Attribute : u64;
 enum class Patch : u64;
 class Inst;
 class Value;
+struct Program;
 } // namespace Shader::IR
 
 namespace Shader::Backend::SPIRV {
@@ -61,6 +62,12 @@ Id EmitGetAttributeIndexed(EmitContext& ctx, Id offset, Id vertex);
 void EmitSetAttributeIndexed(EmitContext& ctx, Id offset, Id value, Id vertex);
 Id EmitGetPatch(EmitContext& ctx, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value);
+Id EmitIsbeRead(EmitContext& ctx, Id address);
+void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
+void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
+void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
+void EmitMeshPrologue(EmitContext& ctx);
+void EmitMeshEpilogue(EmitContext& ctx);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value);
 void EmitSetSampleMask(EmitContext& ctx, Id value);
 void EmitSetFragDepth(EmitContext& ctx, Id value);
@@ -629,5 +636,8 @@ Id EmitDPdxFine(EmitContext& ctx, Id op_a);
 Id EmitDPdyFine(EmitContext& ctx, Id op_a);
 Id EmitDPdxCoarse(EmitContext& ctx, Id op_a);
 Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
+
+Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
+void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

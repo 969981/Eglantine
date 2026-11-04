@@ -72,6 +72,10 @@ void EmitSetAttributeIndexed(EmitContext& ctx, std::string_view offset, std::str
                              std::string_view vertex);
 void EmitGetPatch(EmitContext& ctx, IR::Inst& inst, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, std::string_view value);
+void EmitIsbeRead(EmitContext& ctx);
+void EmitIsbeWriteAttribute(EmitContext& ctx);
+void EmitIsbeWriteMapU8(EmitContext& ctx);
+void EmitIsbeWriteMapU32(EmitContext& ctx);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, std::string_view value);
 void EmitSetSampleMask(EmitContext& ctx, std::string_view value);
 void EmitSetFragDepth(EmitContext& ctx, std::string_view value);
@@ -753,5 +757,8 @@ void EmitDPdxFine(EmitContext& ctx, IR::Inst& inst, std::string_view op_a);
 void EmitDPdyFine(EmitContext& ctx, IR::Inst& inst, std::string_view op_a);
 void EmitDPdxCoarse(EmitContext& ctx, IR::Inst& inst, std::string_view op_a);
 void EmitDPdyCoarse(EmitContext& ctx, IR::Inst& inst, std::string_view op_a);
+
+void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a,
+                      const IR::Value& b, const IR::Value& c);
 
 } // namespace Shader::Backend::GLSL
