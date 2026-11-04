@@ -30,7 +30,7 @@ jobs:
         with:
           ref: nx2
           fetch-depth: 0
-          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          token: ${{ github.token }}
           persist-credentials: true
       - name: Fetch Lichii nx2 and preserve original Eglantine branch history
         shell: bash
