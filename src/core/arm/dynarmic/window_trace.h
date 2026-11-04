@@ -99,17 +99,22 @@ private:
 class Sessions {
 public:
     void Reset(const Kernel::KProcess* owner, u64 base) {
-        current.store(base != 0 ? std::make_shared<Session>(owner, base, next_id.fetch_add(1))
-                                : nullptr);
+        // Portable atomic shared_ptr operations are available in both Apple libc++
+        // and libstdc++, even without atomic<shared_ptr> specialization.
+        std::shared_ptr<Session> replacement;
+        if (base != 0) {
+            replacement = std::make_shared<Session>(owner, base, next_id.fetch_add(1));
+        }
+        std::atomic_store_explicit(&current, replacement, std::memory_order_release);
     }
 
     std::shared_ptr<Session> Find(const Kernel::KProcess* owner) const {
-        auto session = current.load();
+        auto session = std::atomic_load_explicit(&current, std::memory_order_acquire);
         return session && session->owner == owner ? session : nullptr;
     }
 
 private:
-    std::atomic<std::shared_ptr<Session>> current;
+    std::shared_ptr<Session> current;
     std::atomic<u64> next_id{1};
 };
 
