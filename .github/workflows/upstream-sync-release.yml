@@ -49,11 +49,34 @@ jobs:
           if git merge-base --is-ancestor "$source" HEAD; then
             echo "Already synchronized; no new commit required."
           else
-            if ! git merge --no-edit --no-ff "$source"; then
-              git merge --abort || true
-              echo "::error::Lichii nx2 merge has conflicts. Keeping original nx2 unchanged."
-              exit 1
+            # Keep our reviewed workflow definitions and protect them from
+            # unapproved upstream edits, which require workflows write permission.
+            if ! git merge --no-commit --no-ff "$source"; then
+              mapfile -d '' -t conflicted < <(git diff --name-only -z --diff-filter=U)
+              if [ "${#conflicted[@]}" -eq 0 ]; then
+                git merge --abort || true
+                echo "::error::Upstream merge failed without mergeable conflict files."
+                exit 1
+              fi
+              for path in "${conflicted[@]}"; do
+                case "$path" in
+                  .github/workflows/*)
+                    git checkout --ours -- "$path"
+                    git add -- "$path"
+                    ;;
+                  *)
+                    git merge --abort || true
+                    echo "::error::Lichii source conflict in $path. No push was made."
+                    exit 1
+                    ;;
+                esac
+              done
             fi
+            while IFS= read -r -d '' added; do
+              git rm -f -- "$added"
+            done < <(git diff --cached --name-only -z --diff-filter=A -- .github/workflows/)
+            git restore --source=HEAD --staged --worktree -- .github/workflows/
+            git commit -m "Merge Lichii nx2 (retain reviewed local GitHub workflows)"
             git push origin HEAD:refs/heads/nx2
           fi
           merged="$(git rev-parse HEAD)"
