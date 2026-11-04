@@ -1,4 +1,4 @@
-name: release-binaries
+name: Lichii | Build and publish 7-platform binaries
 
 on:
   workflow_dispatch:
@@ -38,7 +38,8 @@ env:
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
 concurrency:
-  group: release-binaries-${{ github.ref }}
+  # Isolate this corrected nx2 pipeline from legacy Eglantine release runs.
+  group: lichii-nx2-release-${{ github.ref }}-v2
   cancel-in-progress: false
 
 jobs:
@@ -70,6 +71,7 @@ jobs:
     name: ${{ matrix.platform }} binary
     needs: prepare-release
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
@@ -620,6 +622,7 @@ jobs:
     needs: build
     if: github.event_name == 'push' || inputs.publish_release
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -652,6 +655,16 @@ jobs:
               (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
             fi
           done
+          # Verify all seven matrix variants before publishing a complete release.
+          for platform in linux-x86_64 linux-x86_64-pgo linux-aarch64 linux-aarch64-pgo; do
+            test -s "dist/lichii-$platform.AppImage"
+            test -s "dist/lichii-$platform.tar.gz"
+          done
+          test -s dist/lichii-windows-x86_64.zip
+          test -s dist/lichii-windows-x86_64-pgo.zip
+          test -s dist/lichii-macos-arm64.zip
+          test -s dist/lichii-macos-arm64.dmg
+          (cd dist && sha256sum lichii-* > SHA256SUMS.txt && sha256sum -c SHA256SUMS.txt)
           ls -la dist
 
       - name: Create release
