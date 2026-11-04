@@ -65,8 +65,24 @@ bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
     }
+    const u64 suspensions_before = suspensions.load(std::memory_order_relaxed);
     if (!puller.ResumeAcquire(*this)) {
         return false;
+    }
+    // Lists queued while the channel waited were read from memory, not as submitted: the game
+    // writes the commands a list runs before it releases the acquire, so the words at submit time
+    // could be older. Reading them as late as the parse is too late in Hyrule Warriors: Age of
+    // Imprisonment fights: a command ring the game had already refilled for a later frame, read
+    // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
+    // waiting forever on a release it never got). The acquire is released now, so the commands
+    // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
+    if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
+        const u64 now = suspensions.load(std::memory_order_acquire);
+        for (CommandList& list : dma_pushbuffer) {
+            if (!list.submitted_offsets.empty()) {
+                RefreshSnapshot(list, now);
+            }
+        }
     }
 
     CommandList& command_list = dma_pushbuffer.front();
@@ -75,7 +91,7 @@ bool DmaPusher::Step() {
     const size_t command_list_size = command_list.command_lists.size();
 
     if (prefetch_size == 0 && command_list_size == 0) {
-        dma_pushbuffer.pop();
+        dma_pushbuffer.pop_front();
         dma_pushbuffer_subindex = 0;
         return true;
     }
@@ -88,7 +104,7 @@ bool DmaPusher::Step() {
             return false;
         }
         command_resume_offset = 0;
-        dma_pushbuffer.pop();
+        dma_pushbuffer.pop_front();
         return true;
     }
 
@@ -104,7 +120,10 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        if (g_nx2_ampere.load(std::memory_order_relaxed)) {
+        // EDEN_NX2_FETCH_DRAIN=1: wait for the back before every entry, as before the split
+        // overlapped the two halves again.
+        static const bool fetch_drain = std::getenv("EDEN_NX2_FETCH_DRAIN") != nullptr;
+        if (fetch_drain && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().Drain();
         }
         bool gpu_written = IsGpuWrittenCommands(dma_state.dma_get,
@@ -116,19 +135,7 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (g_nx2_ampere.load(std::memory_order_relaxed) && words != 0) {
-                    // Fetch synchronization above already drained the back thread. A parameter
-                    // flush must also disqualify the older submission-time snapshot.
-                    const size_t bytes = words * sizeof(u32);
-                    if (memory_manager.IsMemoryDirty(dma_state.dma_get, bytes,
-                                                     VideoCommon::CacheType::BufferCache)) {
-                        memory_manager.FlushRegion(dma_state.dma_get, bytes,
-                                                   VideoCommon::CacheType::BufferCache);
-                        gpu_written = true;
-                    }
-                }
-                if (auto& split = VideoCommon::GpuSplit::Get();
-                    split.Active() && !g_nx2_ampere.load(std::memory_order_relaxed)) {
+                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -174,6 +181,11 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            gpu_written =
+                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
                                command_list.snapshot_suspensions ==
@@ -232,7 +244,7 @@ bool DmaPusher::Step() {
             }
         }
         parked_methods.clear();
-        dma_pushbuffer.pop();
+        dma_pushbuffer.pop_front();
         dma_pushbuffer_subindex = 0;
     } else {
         signal_sync = command_list.command_lists[dma_pushbuffer_subindex].sync && Settings::values.sync_memory_operations.GetValue();
@@ -250,6 +262,16 @@ bool DmaPusher::Step() {
     return true;
 }
 
+// EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
+// address in the 16 bytes there (finds the engine and method that release a semaphore).
+static const u32 g_semaphore_watch = [] {
+    const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+    return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
+}();
+
+// EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
+static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
@@ -265,6 +287,33 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             dma_state.is_last_call = true;
             index += max_write;
         } else if (dma_state.method_count) {
+            // Fast-path batching for consecutive non-execution methods in increasing mode
+            if (!dma_state.non_incrementing && !dma_increment_once &&
+                dma_state.method >= non_puller_methods &&
+                !VideoCommon::GpuSplit::Get().Active() &&
+                g_semaphore_watch == 0) {
+                auto subchannel = subchannels[dma_state.subchannel];
+                if (subchannel != nullptr) {
+                    const size_t available = std::min<size_t>(dma_state.method_count, commands.size() - index);
+                    u32 batch_count = 0;
+                    while (batch_count < available &&
+                           (dma_state.method + batch_count) < subchannel->execution_mask.size() &&
+                           !subchannel->execution_mask[dma_state.method + batch_count]) {
+                        ++batch_count;
+                    }
+                    if (batch_count > 1) {
+                        subchannel->method_sink.reserve(subchannel->method_sink.size() + batch_count);
+                        for (u32 i = 0; i < batch_count; ++i) {
+                            subchannel->method_sink.emplace_back(dma_state.method + i, commands[index + i].argument);
+                        }
+                        dma_state.method += batch_count;
+                        dma_state.method_count -= batch_count;
+                        index += batch_count;
+                        continue;
+                    }
+                }
+            }
+
             auto const command_header = commands[index]; //can copy
             dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
             dma_state.is_last_call = dma_state.method_count <= 1;
@@ -362,15 +411,6 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method_count = command_header.method_count;
 }
 
-// EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
-// address in the 16 bytes there (finds the engine and method that release a semaphore).
-static const u32 g_semaphore_watch = [] {
-    const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
-    return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
-}();
-
-// EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
-static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
 void DmaPusher::WatchArgument(u32 method, u32 argument) const {
     const u32 watch = g_semaphore_watch;
@@ -504,6 +544,19 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
+void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+    list.snapshot_suspensions = now;
+    for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+        const CommandListHeader& entry = list.command_lists[i];
+        const u32 offset = list.submitted_offsets[i];
+        if (offset + entry.size > list.submitted_words.size()) {
+            continue;
+        }
+        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
+                                       entry.size * sizeof(u32));
+    }
+}
+
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
         return false;
@@ -576,12 +629,18 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!IsGpuWrittenCommands(address, size)) {
         return false;
     }
+    // The caches belong to the split's back: it first runs what the front queued (the dispatch
+    // that writes these words among it). The whole pages are flushed: their next lists read
+    // guest memory until GPU work writes them again.
+    VideoCommon::GpuSplit::Get().Drain();
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                      VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(first_page, end_page - first_page,
-                                   VideoCommon::CacheType::BufferCache);
+        VideoCommon::GpuSplit::Get().Run(
+            [memory = &memory_manager, first_page, size = end_page - first_page] {
+                memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
+            });
     }
     if (rasterizer != nullptr) {
         for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {

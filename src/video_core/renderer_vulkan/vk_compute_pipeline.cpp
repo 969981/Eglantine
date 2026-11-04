@@ -247,6 +247,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .pNext = nullptr,
             .requiredSubgroupSize = GuestWarpSize,
         };
+        // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
+        // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
+        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                                   info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                                   info.uses_quad_shuffles || info.uses_fswzadd;
         VkPipelineCreateFlags flags{};
         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
@@ -260,8 +265,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .flags = flags,
             .stage{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext =
-                    device.IsExtSubgroupSizeControlSupported() ? &subgroup_size_ci : nullptr,
+                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+                             ? &subgroup_size_ci
+                             : nullptr,
                 .flags = 0,
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                 .module = *spv_module,
@@ -361,7 +368,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                       std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
             if (desc.has_secondary) {
                 ASSERT(((qmd.const_buffer_enable_mask >> desc.secondary_cbuf_index) & 1) != 0);
-                const u32 secondary_offset{desc.secondary_cbuf_offset + index_offset};
+                const u32 secondary_offset{desc.secondary_cbuf_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
                 const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
@@ -418,8 +425,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     size_t image_index{Shader::NumDescriptors(info.texture_buffer_descriptors) +
                        Shader::NumDescriptors(info.image_buffer_descriptors) +
                        Shader::NumDescriptors(info.texture_descriptors)};
+    written_images.clear();
     for (const auto& desc : info.image_descriptors) {
         for (u32 i = 0; i < desc.count; ++i, ++image_index) {
+            if (desc.is_written) {
+                written_images.push_back(views[image_index].id);
+            }
             const auto& view{texture_cache.GetImageView(views[image_index].id)};
             if (!desc.is_byte_addressed || view.format != PixelFormat::R16_FLOAT) {
                 continue;

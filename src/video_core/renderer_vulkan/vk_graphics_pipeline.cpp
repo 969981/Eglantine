@@ -337,7 +337,12 @@ GraphicsPipeline::GraphicsPipeline(
         try {
             MakePipeline(render_pass);
         } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
+            LOG_CRITICAL(Render_Vulkan,
+                         "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
+                         "patch control points {}, device max patch size {})",
+                         exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
+                         spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
+                         device.GetMaxTessellationPatchSize());
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -378,8 +383,8 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
-    boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
@@ -426,7 +431,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
                     ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
-                    const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
+                    const u32 second_offset{desc.secondary_cbuf_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
                     const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
@@ -501,49 +506,49 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                      Spec::has_images);
     }
 
-    VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
-    const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
-        size_t index{};
-        const auto add_buffer{[&](const auto& desc) {
-            constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
-            for (u32 i = 0; i < desc.count; ++i) {
-                bool is_written{false};
-                if constexpr (is_image) {
-                    is_written = desc.is_written;
-                }
-                ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
-                PixelFormat format{image_view.format};
-                if constexpr (is_image) {
-                    if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
-                        format = *explicit_format;
+    if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
+        VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+        const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+            size_t index{};
+            const auto add_buffer{[&](const auto& desc) {
+                constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
+                for (u32 i = 0; i < desc.count; ++i) {
+                    bool is_written{false};
+                    if constexpr (is_image) {
+                        is_written = desc.is_written;
                     }
+                    ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
+                    PixelFormat format{image_view.format};
+                    if constexpr (is_image) {
+                        if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                            format = *explicit_format;
+                        }
+                    }
+                    buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
+                                                           image_view.BufferSize(), format,
+                                                           is_written, is_image);
+                    ++index;
+                    ++texture_buffer_it;
                 }
-                buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
-                                                       image_view.BufferSize(), format,
-                                                       is_written, is_image);
-                ++index;
-                ++texture_buffer_it;
+            }};
+            buffer_cache.UnbindGraphicsTextureBuffers(stage);
+
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                for (const auto& desc : info.texture_buffer_descriptors) {
+                    add_buffer(desc);
+                }
+            }
+            if constexpr (Spec::has_image_buffers) {
+                for (const auto& desc : info.image_buffer_descriptors) {
+                    add_buffer(desc);
+                }
+            }
+            texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
+            if constexpr (Spec::has_images) {
+                texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
             }
         }};
-        buffer_cache.UnbindGraphicsTextureBuffers(stage);
-
-        const Shader::Info& info{stage_infos[stage]};
-        if constexpr (Spec::has_texture_buffers) {
-            for (const auto& desc : info.texture_buffer_descriptors) {
-                add_buffer(desc);
-            }
-        }
-        if constexpr (Spec::has_image_buffers) {
-            for (const auto& desc : info.image_buffer_descriptors) {
-                add_buffer(desc);
-            }
-        }
-        texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
-        if constexpr (Spec::has_images) {
-            texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
-        }
-    }};
-    {
         Profile::Scope scope{Profile::Zone::TextureBuffers};
         if constexpr (Spec::enabled_stages[0]) {
             bind_stage_info(0);
@@ -559,6 +564,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::enabled_stages[4]) {
             bind_stage_info(4);
+        }
+    } else {
+        if constexpr (Spec::enabled_stages[0]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(4);
         }
     }
 
@@ -688,7 +709,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
-    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
+    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
         descriptor_set_layout && uses_descriptor_buffer &&
@@ -728,20 +749,22 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                             RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
-                             rescaling_data.data());
+        const VkShaderStageFlags push_stages =
+            IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                   VK_SHADER_STAGE_MESH_BIT_EXT
+                             : VK_SHADER_STAGE_ALL_GRAPHICS;
+        cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                             sizeof(rescaling_data), rescaling_data.data());
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*pipeline_layout, push_stages,
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
         if (uses_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                                 RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
-                                 &render_area_data);
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
+                                 sizeof(render_area_data), &render_area_data);
         }
         if (!descriptor_set_layout) {
             return;
@@ -866,7 +889,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .patchControlPoints = key.state.patch_control_points_minus_one.Value() + 1,
+        .patchControlPoints = std::min(key.state.patch_control_points_minus_one.Value() + 1,
+                                       device.GetMaxTessellationPatchSize()),
     };
     std::array<VkViewportSwizzleNV, Maxwell::NumViewports> swizzles;
     std::ranges::transform(key.state.viewport_swizzles, swizzles.begin(), UnpackViewportSwizzle);

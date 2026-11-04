@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -14,9 +16,12 @@
 #include <utility>
 #include <queue>
 #include <source_location>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
+#include "common/dkb_frame_trace.h"
+#include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
@@ -53,9 +58,29 @@ public:
     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {},
                 std::source_location location = std::source_location::current());
 
+    /// On the split GPU thread, a fence or a command list copy submits only if the last
+    /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
+    /// once); otherwise it goes with the next one. The back submits deferred work before it
+    /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
+    bool DeferFlush();
+    /// Submits deferred work (the split's back, from its idle hook).
+    void FlushDeferred();
+    /// Threads other than the split's back: waits until tick is submitted, asking the back to
+    /// submit deferred work (logged every 2 s while it waits). False only when the back thread
+    /// is not running, so nothing will submit it: the caller then submits it itself.
+    bool WaitSubmitted(u64 tick);
+    /// Whether everything up to tick has been handed to the worker for submission.
+    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
+        return tick < master_semaphore->CurrentTick();
+    }
+
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
     void WaitWorker();
+
+    void MarkFrameEnd(u64 frame);
+    void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
+    void TraceComputePipeline(u64 hash);
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -103,7 +128,7 @@ public:
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
     /// Update the rescaling state. Returns true if the state has to be updated.
-    bool UpdateRescaling(bool is_rescaling);
+    bool UpdateRescaling(bool is_rescaling, bool mesh_layout);
 
     /// Returns true when the descriptor buffer chunk has to be bound into the command buffer.
     bool UpdateDescriptorBufferChunk(u32 descriptor_chunk);
@@ -172,12 +197,20 @@ public:
     /// wait for the recording thread to submit the tick instead, and give up after 20 ms (it may
     /// be waiting for them).
     void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true) {
+        const bool trace = Common::DkbFrameTrace::Enabled() && target_fps > 0.0;
+        const auto trace_start = trace ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
         if (tick > 0 && (may_flush || WaitForSubmission(tick))) {
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
             master_semaphore->Wait(tick);
         }
+        const auto trace_waited = trace ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+        double trace_requested_ms{};
+        double trace_sleep_ms{};
+        double trace_slept_ms{};
         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {
             auto now = std::chrono::steady_clock::now();
             if (last_target_fps != target_fps) {
@@ -192,8 +225,22 @@ public:
             if (target_time >= now) {
                 constexpr auto spin_tail = std::chrono::milliseconds(1);
                 auto sleep_time = target_time - now;
+                if (trace) {
+                    trace_requested_ms =
+                        std::chrono::duration<double, std::milli>(sleep_time).count();
+                }
                 if (sleep_time > spin_tail * 2) {
+                    if (trace) {
+                        trace_sleep_ms =
+                            std::chrono::duration<double, std::milli>(sleep_time - spin_tail).count();
+                    }
+                    const auto sleep_start = trace ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
                     std::this_thread::sleep_for(sleep_time - spin_tail);
+                    if (trace) {
+                        trace_slept_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - sleep_start).count();
+                    }
                 }
                 while (std::chrono::steady_clock::now() < target_time) {
                     std::this_thread::yield();
@@ -201,6 +248,21 @@ public:
             } else if (frame_counter > max_frame_count) {
                 frame_counter = 0;
                 start_time = now;
+            }
+        }
+        if (trace) {
+            static thread_local Common::DkbFrameTrace::RateLimit rate;
+            const auto end = std::chrono::steady_clock::now();
+            if (rate.Ready(end)) {
+                LOG_INFO(Render_Vulkan,
+                         "DKB host_pace target_fps={} enabled={} may_flush={} "
+                         "cpu_wait_wall_ms={:.3f} pace_requested_ms={:.3f} "
+                         "sleep_requested_ms={:.3f} sleep_actual_wall_ms={:.3f} "
+                         "pace_actual_wall_ms={:.3f}",
+                         target_fps, Settings::values.use_speed_limit.GetValue(), may_flush,
+                         std::chrono::duration<double, std::milli>(trace_waited - trace_start).count(),
+                         trace_requested_ms, trace_sleep_ms, trace_slept_ms,
+                         std::chrono::duration<double, std::milli>(end - trace_waited).count());
             }
         }
     }
@@ -213,6 +275,9 @@ public:
     std::mutex submit_mutex;
 
 private:
+    std::chrono::steady_clock::time_point last_flush{};
+    bool flush_pending{};
+
     class Command {
     public:
         virtual ~Command() = default;
@@ -302,6 +367,7 @@ private:
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;
+        bool mesh_layout = false;
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
@@ -326,6 +392,9 @@ private:
 
     void AllocateWorkerCommandBuffer();
 
+    void TraceGpuSubmission();
+    void TraceShader(u64 hash, u32 stage);
+
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
     void AllocateNewContext();
@@ -343,6 +412,35 @@ private:
     bool fragment_barrier_pending{};
     bool render_pass_has_stores{};
     std::unique_ptr<CommandPool> command_pool;
+
+    vk::QueryPool trace_query_pool;
+    static constexpr u32 TraceMaxSubmissions = 512;
+    struct SubmissionTrace {
+        struct ShaderUse {
+            u64 hash{};
+            u32 stage{};
+        };
+        u64 tick{};
+        u32 draw_attempts{};
+        u32 dispatch_attempts{};
+        u32 num_shaders{};
+        u32 untracked_uses{};
+        std::array<ShaderUse, 32> shaders{};
+    };
+    SubmissionTrace trace_work;
+    std::vector<SubmissionTrace> trace_submissions;
+    Common::DkbFrameTrace::RateLimit trace_gpu_rate;
+    u64 trace_gpu_tick{};
+    u64 trace_frame_end{};
+    u64 trace_sample_frame{};
+    u32 trace_gpu_count{};
+    u64 trace_gpu_skipped{};
+    u32 trace_timestamp_bits{};
+    float trace_timestamp_period{};
+    bool trace_gpu_recording{};
+    bool trace_gpu_sampling{};
+    bool trace_gpu_pending{};
+    bool trace_gpu_failed{};
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
