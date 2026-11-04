@@ -1,16 +1,11 @@
-# Synchronize Eden's official master into this repository without rewriting history.
-# Scheduled workflows run from the repository default branch, which is currently not master.
-name: Sync Eden upstream and release
+# Bootstrap migration from the historical Eglantine master sync to the Lichii nx2 fork.
+# After the user selects nx2 as default, .github/workflows/lichii-nx2-sync.yml takes over.
+name: Bootstrap Lichii nx2 upstream synchronization
 
 on:
   schedule:
-    - cron: "23,53 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
-    inputs:
-      force_build:
-        description: Build even if the upstream master commit has not changed
-        type: boolean
-        default: true
   push:
     branches:
       - "2ndAdjustmentVulkanV3-STOP_FORCE_PUSHING_CAMILLE"
@@ -19,357 +14,59 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
-  group: eglantine-upstream-sync-runnerfix-v2
+  group: lichii-nx2-bootstrap
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Merge official Eden master
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.sync.outputs.changed }}
-      sha: ${{ steps.sync.outputs.sha }}
-      short_sha: ${{ steps.sync.outputs.short_sha }}
+  bootstrap:
+    name: Merge Lichii nx2 into the existing nx2 branch without force
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: nx2
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
           persist-credentials: true
-      - name: Fetch and safely merge upstream
-        id: sync
+      - name: Fetch Lichii nx2 and preserve original Eglantine branch history
         shell: bash
-        env:
-          FORCE_BUILD: ${{ (github.event_name == 'push' || inputs.force_build) && 'true' || 'false' }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add eden-upstream https://git.eden-emu.dev/eden-emu/eden.git
-          git fetch --no-tags eden-upstream refs/heads/master
-          old_sha="$(git rev-parse HEAD)"
-          upstream_sha="$(git rev-parse FETCH_HEAD)"
-          echo "Local master: $old_sha"
-          echo "Eden upstream: $upstream_sha"
-          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
-            if ! git merge --no-edit --no-ff "$upstream_sha"; then
-              # One-time compatibility migration for Eden's Dynarmic translator API rewrite.
-              # Only these exact conflicts on the known fork base may be resolved automatically.
-              mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
-              expected=(
-                src/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
-                src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
-                src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
-              )
-              safe=true
-              if [[ "$old_sha" != "7068de91353234393f4f1e7962f96e0c66c50958" ]] ||
-                 ! git merge-base --is-ancestor "2bec66c0922673844bc761a0784e89cde7869f00" "$upstream_sha" ||
-                 [[ "${#conflicted[@]}" -ne "${#expected[@]}" ]]; then
-                safe=false
-              else
-                for i in "${!expected[@]}"; do
-                  if [[ "${conflicted[i]}" != "${expected[i]}" ]]; then
-                    safe=false
-                  fi
-                done
-              fi
-              if [[ "$safe" != true ]]; then
-                echo "::error::Unexpected merge conflicts; master is unchanged. Resolve manually."
-                printf 'Unmerged: %s\n' "${conflicted[@]}"
-                git merge --abort || true
-                exit 1
-              fi
-              # The upstream translation entry points now accept UserConfig directly,
-              # which contains this fork's PAUTH option and page-table address-space bits.
-              git checkout --theirs -- "${expected[@]}"
-              git add -- "${expected[@]}"
-              python3 - <<'PY'
-          from pathlib import Path
-          system = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp")
-          content = system.read_text()
-          content = content.replace("options.enable_pauth_returns", "conf.enable_pauth_returns")
-          content = content.replace("options.address_space_bits", "conf.page_table_address_space_bits")
-          if "bool TranslatorVisitor::XPAC_1" not in content or "conf.enable_pauth_returns" not in content:
-              raise SystemExit("PAUTH translation extension did not survive the merge")
-          if "options." in content:
-              raise SystemExit("Old TranslationOptions references remain in system.cpp")
-          config = Path("src/dynarmic/src/dynarmic/interface/A64/config.h").read_text()
-          visitor = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h").read_text()
-          if "bool enable_pauth_returns = false;" not in config or "bool XPAC_1" not in visitor:
-              raise SystemExit("PAUTH config or visitor declarations were lost")
-          system.write_text(content)
-          PY
-              git add src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp
-              git diff --cached --check
-              git commit --no-edit
-              echo "::notice::Resolved verified Dynarmic translator migration; other conflicts still fail closed."
+          git fetch --no-tags origin nx2
+          git switch -C nx2 origin/nx2
+          git remote add lichii https://github.com/zortos293/Lichii.git
+          git fetch --no-tags lichii refs/heads/nx2
+          before="$(git rev-parse HEAD)"
+          source="$(git rev-parse FETCH_HEAD)"
+          echo "Current local nx2: $before"
+          echo "Lichii nx2: $source"
+          if git merge-base --is-ancestor "$source" HEAD; then
+            echo "Already synchronized; no new commit required."
+          else
+            if ! git merge --no-edit --no-ff "$source"; then
+              git merge --abort || true
+              echo "::error::Lichii nx2 merge has conflicts. Keeping original nx2 unchanged."
+              exit 1
             fi
+            git push origin HEAD:refs/heads/nx2
           fi
-          # Dynarmic's current A64 TranslatorVisitor exposes UserConfig as 'conf'.
-          # Older Eglantine PAUTH additions used 'options' and fail to compile on both
-          # Windows and Linux after the upstream translator API migration.
-          python3 - <<'PY'
-          from pathlib import Path
-          branch = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp")
-          config = Path("src/dynarmic/src/dynarmic/interface/A64/config.h")
-          system = Path("src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp")
-          source = branch.read_text()
-          legacy = "if (!options.enable_pauth_returns)"
-          if legacy in source:
-              if source.count(legacy) != 1 or "bool enable_pauth_returns = false;" not in config.read_text() or "conf.enable_pauth_returns" not in system.read_text():
-                  raise SystemExit("Cannot safely migrate Dynarmic RETA PAUTH config: unexpected API")
-              branch.write_text(source.replace(legacy, "if (!conf.enable_pauth_returns)"))
-              print("Migrated the outdated RETA PAUTH option to UserConfig conf")
-          if "options.enable_pauth_returns" in branch.read_text():
-              raise SystemExit("Legacy RETA PAUTH options reference remains")
-          PY
-          if ! git diff --quiet -- src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp; then
-            git add src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
-            git diff --cached --check
-            git commit -m "fix(dynarmic): adapt PAUTH RETA to UserConfig"
-          fi
-          new_sha="$(git rev-parse HEAD)"
-          if [ "$new_sha" != "$old_sha" ]; then
-            git push origin HEAD:refs/heads/master
-          fi
-          changed=false
-          if [ "$new_sha" != "$old_sha" ] || [ "$FORCE_BUILD" = "true" ]; then
-            changed=true
-          fi
-          {
-            echo "changed=$changed"
-            echo "sha=$new_sha"
-            echo "short_sha=${new_sha:0:12}"
-          } >> "$GITHUB_OUTPUT"
-          echo "Result: $changed / $new_sha"
-
-  windows:
-    name: Build Windows x64
-    needs: sync
-    if: needs.sync.outputs.changed == 'true'
-    runs-on: windows-2022
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.sync.outputs.sha }}
-          persist-credentials: false
-      - name: Install MSYS2/UCRT64 toolchain and Qt
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            git make autoconf libtool automake-wrapper patch jq pactoys ninja zip unzip
-          pacboy: >-
-            qt6-base:p qt6-tools:p qt6-translations:p qt6-svg:p qt6-charts:p
-            7zip:p cmake:p toolchain:p clang:p python-pip:p lld:p
-            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p
-            vulkan-memory-allocator:p vulkan-devel:p glslang:p
-            enet:p opus:p mbedtls:p libusb:p unordered_dense:p
-            jbigkit:p xz:p libdeflate:p bzip2:p lerc:p graphite2:p
-            libwebp:p libtiff:p brotli:p
-      - name: Configure and compile
-        run: |
-          set -euo pipefail
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
-            -DENABLE_WERROR=OFF \
-            -DENABLE_QT=ON -DENABLE_QT_TRANSLATION=ON \
-            -DENABLE_UPDATE_CHECKER=OFF \
-            -DYUZU_USE_BUNDLED_SIRIT=ON \
-            -DYUZU_USE_BUNDLED_FFMPEG=ON \
-            -DYUZU_USE_BUNDLED_SDL3=ON \
-            -DYUZU_ROOM_STANDALONE=OFF \
-            -DYUZU_DISABLE_LLVM=ON
-          cmake --build build --parallel 4
-      - name: Bundle Qt and runtime DLLs
-        run: |
-          set -euo pipefail
-          exe="build/bin/eden.exe"
-          test -s "$exe"
-          pkg="package/Eglantine"
-          mkdir -p "$pkg"
-          cp "$exe" "$pkg/"
-          windeployqt6 --no-compiler-runtime "$pkg/eden.exe"
-          copy_deps() {
-            local binary="$1" dll candidate
-            while read -r dll; do
-              candidate="/ucrt64/bin/$dll"
-              if [[ -f "$candidate" && ! -f "$pkg/$dll" ]]; then
-                cp "$candidate" "$pkg/$dll"
-                copy_deps "$candidate"
-              fi
-            done < <(objdump -p "$binary" | awk '/DLL Name:/ {print $3}')
-          }
-          while IFS= read -r -d '' bin; do
-            copy_deps "$bin"
-          done < <(find "$pkg" -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0)
-          cp LICENSE.txt README.md "$pkg/"
-          7z a -tzip Eglantine-Windows-x64.zip "./package/Eglantine/*"
-          test -s Eglantine-Windows-x64.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Eglantine-Windows-x64
-          path: Eglantine-Windows-x64.zip
-          if-no-files-found: error
-
-  linux:
-    name: Build Linux x64 (Ubuntu 26.04)
-    needs: sync
-    if: needs.sync.outputs.changed == 'true'
-    runs-on: ubuntu-latest
-    container: ubuntu:26.04
-    timeout-minutes: 180
-    steps:
-      - name: Install toolchain and distribution dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates git curl python3 python3-pip cmake ninja-build \
-            build-essential autoconf automake libtool patch pkg-config nasm \
-            glslang-tools libglu1-mesa-dev libhidapi-dev libpulse-dev libudev-dev \
-            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 \
-            libxcb-xinerama0 libxcb-xkb1 libxext-dev libxkbcommon-x11-0 \
-            mesa-common-dev qt6-base-private-dev qt6-tools-dev qt6-charts-dev \
-            libfmt-dev liblz4-dev nlohmann-json3-dev libzstd-dev libssl-dev \
-            libavfilter-dev libavcodec-dev libswscale-dev zlib1g-dev \
-            libva-dev libvdpau-dev libvulkan-dev spirv-tools spirv-headers \
-            libusb-1.0-0-dev libxbyak-dev libboost-dev libboost-fiber-dev \
-            libboost-context-dev libsdl3-dev libopus-dev libasound2t64 \
-            vulkan-utility-libraries-dev
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.sync.outputs.sha }}
-          persist-credentials: false
-      - name: Configure and compile
+          merged="$(git rev-parse HEAD)"
+          echo "Synced nx2 to $merged" >> "$GITHUB_STEP_SUMMARY"
+          echo "Upstream Lichii: $source" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remind about the one-time default-branch switch
         shell: bash
-        run: |
-          set -euo pipefail
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
-            -DENABLE_WERROR=OFF \
-            -DENABLE_QT=ON -DENABLE_QT_TRANSLATION=ON \
-            -DENABLE_UPDATE_CHECKER=OFF \
-            -DYUZU_USE_BUNDLED_SIRIT=ON \
-            -DYUZU_USE_BUNDLED_FFMPEG=ON \
-            -DYUZU_ROOM_STANDALONE=OFF \
-            -DYUZU_DISABLE_LLVM=ON
-          cmake --build build --parallel 4
-      - name: Archive executable (Ubuntu 26.04 runtime dependencies)
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s build/bin/eden
-          mkdir -p package/Eglantine
-          cp build/bin/eden LICENSE.txt README.md package/Eglantine/
-          tar -C package -czf Eglantine-Linux-x64-Ubuntu26.04.tar.gz Eglantine
-          test -s Eglantine-Linux-x64-Ubuntu26.04.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Eglantine-Linux-x64
-          path: Eglantine-Linux-x64-Ubuntu26.04.tar.gz
-          if-no-files-found: error
-
-  macos:
-    name: Build macOS arm64 (Apple Silicon)
-    needs: sync
-    if: needs.sync.outputs.changed == 'true'
-    # GitHub's standard Apple Silicon label is macos-15 (not macos-15-arm64).
-    runs-on: macos-15
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.sync.outputs.sha }}
-          persist-credentials: false
-      - name: Install macOS build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew install autoconf automake boost ffmpeg fmt glslang hidapi \
-            libtool libusb lz4 ninja nlohmann-json openssl pkg-config \
-            qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
-            vulkan-loader spirv-tools
-      - name: Configure and compile
-        shell: bash
-        run: |
-          set -euo pipefail
-          export CMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl@3)"
-          export Qt6_DIR="$(brew --prefix qt@6)/lib/cmake/Qt6"
-          export LIBVULKAN_PATH="$(brew --prefix vulkan-loader)/lib/libvulkan.dylib"
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF \
-            -DENABLE_WERROR=OFF \
-            -DENABLE_QT=ON -DENABLE_QT_TRANSLATION=ON \
-            -DENABLE_UPDATE_CHECKER=OFF -DENABLE_WEB_SERVICE=OFF \
-            -DENABLE_LIBUSB=OFF \
-            -DYUZU_USE_BUNDLED_VCPKG=OFF \
-            -DYUZU_USE_BUNDLED_SIRIT=ON \
-            -DYUZU_USE_EXTERNAL_FFMPEG=ON \
-            -DYUZU_ROOM_STANDALONE=OFF -DYUZU_DISABLE_LLVM=ON
-          cmake --build build --parallel 3
-      - name: Package macOS app
-        shell: bash
-        run: |
-          set -euo pipefail
-          app="build/bin/eden.app"
-          test -s "$app/Contents/MacOS/eden"
-          mkdir -p package
-          cp -R "$app" package/Eglantine.app
-          "$(brew --prefix qt@6)/bin/macdeployqt" package/Eglantine.app -always-overwrite
-          codesign --force --deep --sign - package/Eglantine.app
-          cp LICENSE.txt README.md package/
-          tar -C package -czf Eglantine-macOS-arm64.tar.gz Eglantine.app LICENSE.txt README.md
-          test -s Eglantine-macOS-arm64.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Eglantine-macOS-arm64
-          path: Eglantine-macOS-arm64.tar.gz
-          if-no-files-found: error
-
-  release:
-    name: Publish Release
-    needs: [sync, windows, linux, macos]
-    if: always() && needs.sync.outputs.changed == 'true' && needs.windows.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - name: Download successful build archives
-        uses: actions/download-artifact@v4
-        with:
-          path: release-files
-          merge-multiple: true
-      - name: Verify Windows archive
-        shell: bash
-        run: test -s release-files/Eglantine-Windows-x64.zip
-      - name: Create release for synchronized source commit
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: upstream-${{ needs.sync.outputs.short_sha }}
-          target_commitish: ${{ needs.sync.outputs.sha }}
-          name: Eglantine upstream ${{ needs.sync.outputs.short_sha }}
-          prerelease: true
-          make_latest: false
-          body: |
-            Automatically synchronized with the official Eden master branch.
-            Source commit: `${{ needs.sync.outputs.sha }}`
-            Windows x64: portable ZIP, includes Qt/runtime dependencies.
-            Linux x64: Ubuntu 26.04 build (not a portable AppImage).
-            macOS arm64: experimental Apple Silicon app archive (ad-hoc signed).
-            If Linux or macOS builds fail, successful build archives may still be released when Windows succeeds.
-          files: release-files/*
-          fail_on_unmatched_files: true
-          overwrite_files: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          current="$(gh api "repos/$GH_REPO" --jq '.default_branch')"
+          echo "Current default: $current" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$current" != "nx2" ]; then
+            echo "::notice::Switch default branch to nx2 in Settings > General > Default branch. The nx2-native scheduled sync workflow is already installed."
+          fi
