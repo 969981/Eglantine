@@ -1,6 +1,7 @@
-# Keep the historical Eglantine branches intact while tracking Lichii's Switch 2 work.
-# This scheduled workflow is active once nx2 is selected as the repository default branch.
-name: Sync Lichii nx2 upstream and dispatch builds
+# Lichii nx2: preserve the historical Eglantine branches, mirror source safely, and
+# explicitly dispatch the release workflow after GITHUB_TOKEN merges (which do not
+# trigger push-based Actions). Upstream CI workflow changes require separate review.
+name: Lichii | Sync upstream nx2 and launch releases
 
 on:
   schedule:
@@ -11,6 +12,10 @@ on:
         description: "Dispatch a build even if Lichii nx2 did not change"
         type: boolean
         default: false
+  push:
+    branches: [nx2]
+    paths:
+      - ".github/workflows/lichii-nx2-sync.yml"
 
 permissions:
   contents: write
@@ -98,7 +103,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   trigger-build:
-    name: Build nx2 release after update, once nx2 is default
+    name: Dispatch 7-platform Lichii release build when upstream changes
     needs: sync
     if: needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build)
     runs-on: ubuntu-24.04
@@ -107,15 +112,16 @@ jobs:
       - name: Dispatch the nx2 release matrix
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           default_branch="$(gh api "repos/$GH_REPO" --jq '.default_branch')"
           if [ "$default_branch" != "nx2" ]; then
-            echo "::notice::Set the repository default branch to nx2 in Settings > General before workflow_dispatch can run the nx2-only release workflow."
-            echo "The nx2 source branch was updated; no build was triggered because default is $default_branch." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "::error::Default branch must remain nx2; actual default is $default_branch."
+            exit 1
           fi
-          gh workflow run release-binaries.yml --ref nx2 -f publish_release=true
-          echo "Dispatched the upstream Lichii multi-platform build from nx2." >> "$GITHUB_STEP_SUMMARY"
+          # workflow_dispatch is an allowed downstream trigger from GITHUB_TOKEN;
+          # the source-merge push alone intentionally does not trigger Actions.
+          gh workflow run release-binaries.yml --repo "$GH_REPO" --ref nx2 -f publish_release=true
+          echo "Dispatched 7-platform Lichii release build on $GH_REPO/nx2." >> "$GITHUB_STEP_SUMMARY"
