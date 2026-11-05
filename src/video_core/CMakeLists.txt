@@ -101,6 +101,7 @@ add_library(video_core STATIC
     fence_manager.h
     gpu.cpp
     gpu.h
+    gpu_timestamp.h
     gpu_split.cpp
     gpu_split.h
     gpu_thread.cpp
@@ -112,6 +113,7 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_cmdpage_diag.h
     nx2_profile.h
     present.h
     pte_kind.h
@@ -239,6 +241,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_wrapper.cpp
     vulkan_common/vulkan_wrapper.h
     vulkan_common/nsight_aftermath_tracker.cpp
+    vulkan_common/aftermath_dump.h
     vulkan_common/nsight_aftermath_tracker.h
     vulkan_common/vma.h
     vulkan_common/vulkan.h

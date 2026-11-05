@@ -5,6 +5,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/aftermath_dump.cpp
+    video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_present_pacer.cpp
@@ -138,6 +140,12 @@ if (TARGET dynarmic::dynarmic)
 endif()
 
 add_test(NAME tests COMMAND tests)
+
+add_executable(update_checker_tests
+    common/update_checker.cpp
+    ../frontend_common/update_checker.cpp)
+target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME update_checker_tests COMMAND update_checker_tests)
 
 # needed for vma
 if (NOT MSVC)

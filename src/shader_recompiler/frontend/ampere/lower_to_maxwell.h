@@ -1870,8 +1870,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native uniform comparison mode");
             const u32 temporary = 6 - output, combine_slot = combine == 7 ? 7U : 6 - combine;
             const u32 combine_mask = combine == 7 ? 0U : 1U << combine_slot;
-            const u32 comparison_output_mask = 1U << temporary;
-            const u32 mask = comparison_output_mask | combine_mask;
+            const u32 temporary_mask = 1U << temporary, mask = temporary_mask | combine_mask;
             if (opcode == 0x88c) mov_imm(252, insn.words[1]);
             emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20));
             if (combine_mask) emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{combine_mask} << 20));
@@ -1879,7 +1878,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{a} << 8) | (u64{b} << 20) | (u64{combine_slot} << 39) |
                 (u64{insn.Bits(90, 1)} << 42) | (u64{combine_op} << 45) | (u64{insn.Bits(73, 1)} << 48) |
                 (u64{insn.Bits(76, 3)} << 49));
-            emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{comparison_output_mask} << 20));
+            emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{temporary_mask} << 20));
             emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{mask} << 20));
             break;
         }
@@ -2431,7 +2430,6 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                              (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding))))
                 return fail(index, "native texture gather mode");
             if (per_tap) {
-                // Reuse the enclosing gather register limit; MSVC forbids hiding it.
                 if (!insn.Bits(60, 1) || mask != 15 || source_a + 1 >= register_limit ||
                     source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit) ||
                     (second_dest != 255 && second_dest + 1 >= register_limit))
@@ -3719,7 +3717,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const bool pending_main_branch = std::any_of(
                     relocations.begin(), relocations.end(), [&](const Relocation& relocation) {
                         return !relocation.call && relocation.target > index &&
-                               relocation.target != geometry_exit->handler / sizeof(Instruction);
+                               relocation.target !=
+                                   static_cast<s64>(geometry_exit->handler / sizeof(Instruction));
                     });
                 if (geometry_exit->has_returns && native_predicate == 7 && !main_exited && !pending_main_branch &&
                     !call_targets.empty()) {
