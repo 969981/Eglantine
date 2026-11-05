@@ -78,6 +78,14 @@ jobs:
                     git checkout --ours -- "$path"
                     git add -- "$path"
                     ;;
+                  # These two source files diverged in local nx2 history.
+                  # Prefer the canonical upstream for these reviewed conflicts.
+                  # Other source conflicts still fail closed for manual review.
+                  src/core/arm/dynarmic/window_trace.h|src/shader_recompiler/frontend/ampere/lower_to_maxwell.h)
+                    git checkout --theirs -- "$path"
+                    git add -- "$path"
+                    echo "Resolved reviewed source conflict from Lichii nx2: $path" >> "$GITHUB_STEP_SUMMARY"
+                    ;;
                   *)
                     git merge --abort || true
                     echo "::error::Source conflict in $path; nx2 was not pushed."
