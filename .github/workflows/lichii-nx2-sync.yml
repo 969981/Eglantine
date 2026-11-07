@@ -58,50 +58,61 @@ jobs:
           echo "Lichii upstream: $upstream"
           echo "Local nx2 before sync: $before"
           echo "source=$upstream" >> "$GITHUB_OUTPUT"
-          if git merge-base --is-ancestor "$upstream" HEAD; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Lichii nx2 is already included; no merge required."
+          # Mirror source content as an incremental commit, not the original
+          # upstream commit ancestry: the Actions token cannot push upstream
+          # commits that modify workflows even if the final tree restores ours.
+          state=.github/lichii-nx2-upstream.sha
+          if [ -f "$state" ]; then
+            previous="$(cat "$state")"
           else
-            # Preserve local workflow files: automatic GitHub App pushes cannot safely
-            # update .github/workflows without an explicit workflows grant. Upstream
-            # workflow changes are reviewed/applied separately through the GitHub connector.
-            if ! git merge --no-commit --no-ff "$upstream"; then
-              mapfile -d '' -t conflicted < <(git diff --name-only -z --diff-filter=U)
-              if [ "${#conflicted[@]}" -eq 0 ]; then
-                git merge --abort || true
-                echo "::error::Upstream merge failed for reasons other than file conflicts."
-                exit 1
-              fi
-              for path in "${conflicted[@]}"; do
-                case "$path" in
-                  .github/workflows/*)
-                    git checkout --ours -- "$path"
-                    git add -- "$path"
-                    ;;
-                  # These two source files diverged in local nx2 history.
-                  # Prefer the canonical upstream for these reviewed conflicts.
-                  # Other source conflicts still fail closed for manual review.
-                  src/core/arm/dynarmic/window_trace.h|src/shader_recompiler/frontend/ampere/lower_to_maxwell.h)
-                    git checkout --theirs -- "$path"
-                    git add -- "$path"
-                    echo "Resolved reviewed source conflict from Lichii nx2: $path" >> "$GITHUB_STEP_SUMMARY"
-                    ;;
-                  *)
-                    git merge --abort || true
-                    echo "::error::Source conflict in $path; nx2 was not pushed."
-                    exit 1
-                    ;;
-                esac
-              done
+            previous="$(git merge-base HEAD "$upstream")"
+          fi
+          test -n "$previous" && git cat-file -e "$previous^{commit}"
+          if [ "$previous" = "$upstream" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Lichii nx2 source already synchronized."
+          else
+            if ! git merge-base --is-ancestor "$previous" "$upstream"; then
+              echo "::error::Lichii upstream history was rewritten. Review before syncing."
+              exit 1
             fi
-            while IFS= read -r -d '' added; do
-              git rm -f -- "$added"
-            done < <(git diff --cached --name-only -z --diff-filter=A -- .github/workflows/)
-            git restore --source=HEAD --staged --worktree -- .github/workflows/
-            git commit -m "Merge Lichii nx2 (retain reviewed local GitHub workflows)"
-            # A normal non-force push retains all previous Eglantine and local nx2 commits.
+            patch="$RUNNER_TEMP/lichii-nx2-upstream.patch"
+            git diff --binary "$previous" "$upstream" -- . ':(exclude).github/workflows/**' > "$patch"
+            source_changed=false
+            if [ -s "$patch" ]; then
+              if ! git apply --3way --index "$patch"; then
+                mapfile -d '' -t conflicted < <(git diff --name-only -z --diff-filter=U)
+                if [ "${#conflicted[@]}" -eq 0 ]; then
+                  echo "::error::Patch failed without resolvable conflicts; refusing sync."
+                  exit 1
+                fi
+                for path in "${conflicted[@]}"; do
+                  case "$path" in
+                    # The same two upstream-source overrides were reviewed in
+                    # the previous merge-based workflow.
+                    src/core/arm/dynarmic/window_trace.h|src/shader_recompiler/frontend/ampere/lower_to_maxwell.h)
+                      git show "$upstream:$path" > "$path"
+                      git add -- "$path"
+                      echo "Resolved reviewed source conflict: $path" >> "$GITHUB_STEP_SUMMARY"
+                      ;;
+                    *)
+                      echo "::error::Unreviewed source conflict: $path"
+                      exit 1
+                      ;;
+                  esac
+                done
+              fi
+              if ! git diff --cached --quiet; then source_changed=true; fi
+            fi
+            printf '%s\n' "$upstream" > "$state"
+            git add -- "$state"
+            if git diff --cached --name-only | grep -q '^.github/workflows/'; then
+              echo '::error::Sync bot must not change local workflow files.'
+              exit 1
+            fi
+            git commit -m "chore(sync): Lichii nx2 source $upstream"
             git push origin HEAD:refs/heads/nx2
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "changed=$source_changed" >> "$GITHUB_OUTPUT"
           fi
           merged="$(git rev-parse HEAD)"
           echo "merged=$merged" >> "$GITHUB_OUTPUT"
