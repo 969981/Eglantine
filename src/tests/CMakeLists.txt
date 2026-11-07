@@ -59,8 +59,13 @@ add_executable(tests
     video_core/async_draw_policy.cpp
     video_core/async_shader_emission.cpp
     video_core/pipeline_build.cpp
+    video_core/pipeline_optimization.cpp
+    video_core/spirv_atomic_retry.cpp
+    video_core/spirv_storage_alignment.cpp
+    video_core/spirv_fragment_shuffle.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/gpu_written_pages.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
@@ -71,6 +76,7 @@ add_executable(tests
     common/queue_lifetime.cpp
     common/queue_timed_wait.cpp
     common/range_set_move.cpp
+    common/range_set_subtract.cpp
     video_core/uniform_cache_history.cpp
     video_core/x8d24_conversion.cpp
     video_core/ampere_ported_half_compare.cpp
@@ -168,6 +174,15 @@ add_executable(update_checker_tests
     ../frontend_common/update_checker.cpp)
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
+
+if (NOT ANDROID)
+    add_executable(config_tests
+        common/first_run_config.cpp
+        ../frontend_common/config.cpp)
+    target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
+        ${PLATFORM_LIBRARIES})
+    add_test(NAME config_tests COMMAND config_tests)
+endif()
 
 # needed for vma
 if (NOT MSVC)
